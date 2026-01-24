@@ -275,7 +275,7 @@ safe-rm ls --expired
 #### 输出示例
 
 ```
-=== Safe-RM Trash List (Total: 2) ===
+
 ▶ Name: test.txt_1735689000000000000
   Type: File
   Original: /home/user/test.txt
