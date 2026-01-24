@@ -5,8 +5,9 @@ use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 // 配置常量
 const DEFAULT_EXPIRE_DAYS: i64 = 7;
@@ -15,10 +16,23 @@ const META_FILE: &str = ".safe-rm/metadata.json";
 
 #[derive(Parser, Debug)]
 #[command(
-    author = "Your Name",
+    author = "Your Name <your.email@example.com>",
     version = "1.0.0",
-    about = "Safe rm tool with restore/auto-clean (compatible with rm habits)",
-    long_about = "A safe alternative to rm: move files to trash instead of permanent delete, support restore, auto-clean, recursive dir handling.\n\nExamples:\n  safe-rm del test.txt          # Delete file (7 days expire)\n  safe-rm res test.txt_123456  # Restore deleted file\n  safe-rm ls                   # List trash files\n  safe-rm cln                  # Clean expired files"
+    about = "Safe alternative to rm: move files to trash instead of permanent delete",
+    long_about = r#"Safe rm (safe-rm) is a secure replacement for the native rm command that prevents accidental permanent file deletion.
+Key features:
+1. Moves files/directories to a trash directory (~/.safe-rm/trash) instead of deleting them
+2. Supports restoring deleted files to their original paths
+3. Auto-cleans expired files (default: 7 days)
+4. Protects system directories from accidental deletion
+5. Handles symlinks, regular files, and directories correctly
+
+Basic usage:
+  safe-rm del <file>          # Move file to trash
+  safe-rm ls                  # List trash contents
+  safe-rm res <trash-name>    # Restore file from trash
+  safe-rm cln                 # Clean expired files
+"#
 )]
 struct Cli {
     #[command(subcommand)]
@@ -27,45 +41,137 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    #[command(alias = "del", about = "Delete file/dir (recursive support)", long_about = "Move file/directory to trash (include nested files/dirs).\nExamples:\n  safe-rm delete test.txt                # Delete single file\n  safe-rm del /home/user/test_dir        # Delete directory (recursive)\n  safe-rm delete --expire-days 3 file1.txt file2.txt  # Batch delete\n  safe-rm del -f /tmp/system_test        # Force delete (skip system check)")]
+    #[command(
+        alias = "del",
+        about = "Move files/directories to trash (recursive support)",
+        long_about = r#"Move specified files or directories to the trash directory (~/.safe-rm/trash).
+Files are not permanently deleted and can be restored later.
+Supports batch deletion of multiple paths and custom expiration days.
+System directories (e.g., /bin, /usr, /root) are protected by default - use -f to override.
+Symlinks are handled as-is (only the link is moved, not the target)."#
+    )]
     Delete {
-        #[arg(required = true, help = "Path(s) to delete (file/dir, support multiple)")]
+        #[arg(
+            required = true,
+            help = "One or more paths to files/directories to move to trash",
+            long_help = "Path(s) to the file or directory you want to delete (move to trash). Multiple paths can be specified separated by spaces."
+        )]
         paths: Vec<PathBuf>,
-        #[arg(short = 'd', long, default_value_t = DEFAULT_EXPIRE_DAYS, help = "Expire days (default: 7)")]
+
+        #[arg(
+            short = 'd',
+            long,
+            default_value_t = DEFAULT_EXPIRE_DAYS,
+            help = "Number of days until the file expires (default: 7)",
+            long_help = "Set custom expiration days for the deleted files. After this period, the files will be automatically cleaned up from the trash. Default value is 7 days."
+        )]
         expire_days: i64,
-        #[arg(short = 'f', long, help = "Force delete (skip system dir check)")]
+
+        #[arg(
+            short = 'f',
+            long,
+            help = "Force delete - skip system directory protection check",
+            long_help = "Force deletion of files in protected system directories (/bin, /sbin, /etc, /usr, /lib, /lib64, /root, /boot). Use this option with extreme caution as it may damage your system."
+        )]
         force: bool,
     },
 
-    #[command(alias = "res", about = "Restore deleted file/dir", long_about = "Restore file/directory from trash to original path.\nExamples:\n  safe-rm restore test.txt_123456        # Restore single file\n  safe-rm res dir_123456 file_123457    # Batch restore\n  safe-rm restore --force dir_123456    # Force restore (overwrite existing file)")]
+    #[command(
+        alias = "res",
+        about = "Restore files/directories from trash to original path",
+        long_about = r#"Restore specified items from the trash directory back to their original locations.
+Requires the trash name (from `safe-rm list` output) as input.
+By default, will not overwrite existing files at the target path - use -f to force overwrite.
+Supports batch restoration of multiple trash items."#
+    )]
     Restore {
-        #[arg(required = true, help = "Trash name(s) (from `safe-rm list`)")]
+        #[arg(
+            required = true,
+            help = "One or more trash names to restore (from `safe-rm list`)",
+            long_help = "Trash name(s) of the files/directories to restore. These names are generated by safe-rm (e.g., 'file.txt_1735689000000000000') and can be listed with `safe-rm list`."
+        )]
         names: Vec<String>,
-        #[arg(short = 'f', long, help = "Force restore (overwrite existing)")]
+
+        #[arg(
+            short = 'f',
+            long,
+            help = "Force restore - overwrite existing files at target path",
+            long_help = "Force restoration even if a file/directory already exists at the original path. This will overwrite the existing file/directory with the one from trash."
+        )]
         force: bool,
     },
 
-    #[command(alias = "ls", about = "List trash files/dirs", long_about = "Show all files in trash with detail info.\nExamples:\n  safe-rm list                # List all trash files\n  safe-rm ls --expired        # Only show expired files")]
+    #[command(
+        alias = "ls",
+        about = "List all items in the trash directory with details",
+        long_about = r#"List all files and directories currently in the trash (~/.safe-rm/trash).
+Shows detailed information including:
+- Trash name (used for restoration)
+- File type (File/Directory/Symlink)
+- Original path
+- Deletion time
+- Expiration days and remaining time until expiration
+Use --expired to filter only items that have passed their expiration date."#
+    )]
     List {
-        #[arg(long, help = "Only show expired files")]
+        #[arg(
+            long,
+            help = "Only show expired items in trash",
+            long_help = "Filter the list to show only items that have passed their expiration date and are eligible for automatic cleanup."
+        )]
         expired: bool,
     },
 
-    #[command(alias = "cln", about = "Clean expired files", long_about = "Manually clean all expired files in trash.\nExamples:\n  safe-rm clean               # Clean expired files\n  safe-rm cln --all           # Clean ALL trash files (no expire check)")]
+    #[command(
+        alias = "cln",
+        about = "Clean expired items from trash",
+        long_about = r#"Manually clean up items from the trash directory.
+By default, only removes items that have expired (based on their expiration days).
+Use --all to remove ALL items from trash (ignores expiration status) - use with caution."#
+    )]
     Clean {
-        #[arg(short = 'a', long, help = "Clean ALL trash files (CAUTION!)")]
+        #[arg(
+            short = 'a',
+            long,
+            help = "Clean ALL items (ignore expiration - CAUTION!)",
+            long_help = "Clean all items from the trash directory, regardless of their expiration status. This is irreversible for items that haven't expired yet - use extreme caution."
+        )]
         all: bool,
     },
 
-    #[command(alias = "exp", about = "Check expire time", long_about = "Show expire time of a specific trash file.\nExamples:\n  safe-rm expire test.txt_123456        # Check expire time")]
+    #[command(
+        alias = "exp",
+        about = "Check expiration information for a trash item",
+        long_about = r#"Show detailed expiration information for a specific item in the trash.
+Displays:
+- Original path of the item
+- Time it was deleted
+- Exact expiration time
+- Remaining time until expiration (or time since expiration if expired)"#
+    )]
     Expire {
-        #[arg(required = true, help = "Trash name to check")]
+        #[arg(
+            required = true,
+            help = "Trash name to check expiration for",
+            long_help = "Trash name of the item to check (from `safe-rm list` output, e.g., 'file.txt_1735689000000000000')."
+        )]
         name: String,
     },
 
-    #[command(alias = "empty", about = "Empty trash", long_about = "Permanently delete all files in trash.\nExamples:\n  safe-rm empty               # Empty trash (need confirm)\n  safe-rm empty --yes         # Empty without confirm")]
+    #[command(
+        alias = "empty",
+        about = "Permanently empty the entire trash directory",
+        long_about = r#"Permanently delete ALL items from the trash directory.
+This operation is irreversible - all files in trash will be permanently deleted.
+Requires confirmation by default - use --yes to skip confirmation."#
+    )]
     Empty {
-        #[arg(short = 'y', long, help = "Skip confirmation")]
+        #[arg(
+            short = 'y',
+            long,
+            help = "Skip confirmation prompt - empty trash immediately",
+            long_help = "Bypass the confirmation prompt and immediately empty the entire trash directory. All items will be permanently deleted with no way to recover them."
+        )]
         yes: bool,
     },
 }
@@ -76,37 +182,307 @@ struct FileMeta {
     trash_path: PathBuf,
     delete_time: String,
     expire_days: i64,
-    is_dir: bool,
+    file_type: FileType,
 }
 
-// 递归复制目录
-fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(&dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+enum FileType {
+    File,
+    Dir,
+    Symlink,
+}
+
+// 递归复制：保留符号链接
+fn copy_path(src: &Path, dst: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(src)?;
+    if meta.file_type().is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let dst_entry = dst.join(entry.file_name());
+            copy_path(&entry.path(), &dst_entry)?;
         }
+    } else if meta.file_type().is_symlink() {
+        let target = fs::read_link(src)?;
+        std::os::unix::fs::symlink(target, dst)?;
+    } else {
+        fs::copy(src, dst)?;
     }
     Ok(())
 }
 
-// 递归恢复目录（从 trash 到原位置）
-fn restore_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(&dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            restore_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+// 统一删除
+fn remove_path(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+// 加载元数据
+fn load_metadata(meta_file: &Path) -> HashMap<String, FileMeta> {
+    if !meta_file.exists() {
+        return HashMap::new();
+    }
+    match fs::read_to_string(meta_file) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(meta) => meta,
+            Err(e) => {
+                eprintln!("⚠️  Metadata corrupted: {}, resetting", e);
+                HashMap::new()
+            }
+        },
+        Err(e) => {
+            eprintln!("⚠️  Failed to read metadata: {}, resetting", e);
+            HashMap::new()
         }
     }
-    Ok(())
+}
+
+// 保存元数据（静默失败）
+fn save_metadata(metadata: &HashMap<String, FileMeta>, meta_file: &Path) {
+    if let Ok(content) = serde_json::to_string_pretty(metadata) {
+        let _ = fs::write(meta_file, content);
+    }
+}
+
+// 格式化剩余时间
+fn format_remaining(remaining: Duration) -> String {
+    if remaining.num_seconds() <= 0 {
+        return "Expired".to_string();
+    }
+    let days = remaining.num_days();
+    let hours = remaining.num_hours() % 24;
+    if days > 0 {
+        format!("{} days left", days)
+    } else {
+        format!("{} hours left", hours.max(1))
+    }
+}
+
+// 删除处理
+fn handle_delete(
+    path: &Path,
+    expire_days: i64,
+    force: bool,
+    trash_dir: &Path,
+    metadata: &mut HashMap<String, FileMeta>,
+) {
+    // 获取绝对路径（不解析符号链接！）
+    let path_abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(e) => {
+                eprintln!("⚠️  Skip '{}': Failed to get current dir: {}", path.display(), e);
+                return;
+            }
+        }
+    };
+
+    // 获取元数据（不解析符号链接）
+    let meta = match fs::symlink_metadata(&path_abs) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("⚠️  Skip '{}': {}", path.display(), e);
+            return;
+        }
+    };
+    let is_symlink = meta.file_type().is_symlink();
+    let file_type = if is_symlink {
+        FileType::Symlink
+    } else if meta.is_dir() {
+        FileType::Dir
+    } else {
+        FileType::File
+    };
+
+    // 系统目录保护（跳过符号链接）
+    if !force && !is_symlink {
+        let system_paths = ["/bin", "/sbin", "/etc", "/usr", "/lib", "/lib64", "/root", "/boot"];
+        let path_str = path_abs.to_str().unwrap_or("");
+        if system_paths.iter().any(|p| path_str.starts_with(p)) {
+            eprintln!("❌  Skip '{}': System directory protected (use -f to force)", path.display());
+            return;
+        }
+    }
+
+    let file_name = path_abs.file_name().unwrap().to_str().unwrap();
+    let timestamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let trash_name = format!("{}_{}", file_name, timestamp);
+    let trash_path = trash_dir.join(&trash_name);
+
+    println!("📤 Moving '{}' to trash (expire in {} days)...", path.display(), expire_days);
+    if copy_path(&path_abs, &trash_path).is_err() || remove_path(&path_abs).is_err() {
+        let _ = remove_path(&trash_path); // 回滚
+        eprintln!("❌  Failed to move '{}' to trash", path.display());
+        return;
+    }
+
+    metadata.insert(
+        trash_name,
+        FileMeta {
+            original_path: path_abs,
+            trash_path: trash_path.clone(),
+            delete_time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            expire_days,
+            file_type,
+        },
+    );
+    println!("✅  Moved to trash: {}", trash_path.display());
+}
+
+// 恢复处理
+fn handle_restore(name: &str, force: bool, metadata: &mut HashMap<String, FileMeta>) {
+    let Some(meta) = metadata.remove(name) else {
+        eprintln!("❌  Restore '{}': Not found in trash", name);
+        return;
+    };
+
+    if !meta.trash_path.exists() {
+        eprintln!("❌  Restore '{}': Trash file not found", name);
+        metadata.insert(name.to_string(), meta);
+        return;
+    }
+
+    if meta.original_path.exists() && !force {
+        eprintln!(
+            "❌  Restore '{}': Target '{}' exists (use -f to force)",
+            name,
+            meta.original_path.display()
+        );
+        metadata.insert(name.to_string(), meta);
+        return;
+    }
+
+    if force && meta.original_path.exists() {
+        let _ = remove_path(&meta.original_path);
+    }
+
+    println!("🔄 Restoring '{}' to '{}'...", name, meta.original_path.display());
+    if copy_path(&meta.trash_path, &meta.original_path).is_err() || remove_path(&meta.trash_path).is_err() {
+        eprintln!("❌  Failed to restore '{}'", name);
+        metadata.insert(name.to_string(), meta);
+        return;
+    }
+    println!("✅  Restored: {}", meta.original_path.display());
+}
+
+// 列表展示
+fn handle_list(metadata: &HashMap<String, FileMeta>, expired: bool) {
+    if metadata.is_empty() {
+        println!("🗑️  Trash is empty");
+        return;
+    }
+
+    println!("=== Safe-RM Trash List (Total: {}) ===", metadata.len());
+    let now = Local::now();
+
+    for (name, meta) in metadata {
+        let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
+        let delete_time = Local.from_local_datetime(&delete_time).unwrap();
+        let expire_time = delete_time + Duration::days(meta.expire_days);
+        let remaining_dur = expire_time.signed_duration_since(now);
+
+        if expired && remaining_dur.num_seconds() > 0 {
+            continue;
+        }
+
+        let remaining_str = format_remaining(remaining_dur);
+        println!("▶ Name: {}", name);
+        println!(
+            "  Type: {}",
+            match meta.file_type {
+                FileType::File => "File",
+                FileType::Dir => "Directory",
+                FileType::Symlink => "Symlink",
+            }
+        );
+        println!("  Original: {}", meta.original_path.display());
+        println!("  Delete Time: {}", meta.delete_time);
+        println!("  Expire: {} ({})", meta.expire_days, remaining_str);
+        println!("---------------------------");
+    }
+}
+
+// 清理回收站
+fn clean_trash(metadata: &mut HashMap<String, FileMeta>, clean_all: bool) {
+    let now = Local::now();
+    let to_remove: Vec<String> = metadata
+        .iter()
+        .filter(|(_, meta)| {
+            clean_all
+                || {
+                    let delete_time =
+                        NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
+                    let delete_time = Local.from_local_datetime(&delete_time).unwrap();
+                    let expire_time = delete_time + Duration::days(meta.expire_days);
+                    now > expire_time
+                }
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    for name in to_remove {
+        if let Some(meta) = metadata.remove(&name) {
+            let _ = remove_path(&meta.trash_path);
+            println!("🗑️  Cleaned: {}", name);
+        }
+    }
+}
+
+// 检查过期时间
+fn handle_expire(name: &str, metadata: &HashMap<String, FileMeta>) {
+    let Some(meta) = metadata.get(name) else {
+        eprintln!("❌  '{}' not found in trash", name);
+        return;
+    };
+
+    let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
+    let delete_time = Local.from_local_datetime(&delete_time).unwrap();
+    let expire_time = delete_time + Duration::days(meta.expire_days);
+    let remaining_dur = expire_time.signed_duration_since(Local::now());
+
+    println!("=== Expire Info for '{}' ===", name);
+    println!("Original Path: {}", meta.original_path.display());
+    println!("Delete Time: {}", meta.delete_time);
+    println!("Expire Time: {}", expire_time.format("%Y-%m-%d %H:%M:%S"));
+
+    if remaining_dur.num_seconds() > 0 {
+        println!(
+            "Remaining Time: {} days, {} hours",
+            remaining_dur.num_days(),
+            remaining_dur.num_hours() % 24
+        );
+    } else {
+        println!("Status: Expired ({} hours ago)", -remaining_dur.num_hours());
+    }
+}
+
+// 清空回收站
+fn handle_empty(yes: bool, metadata: &mut HashMap<String, FileMeta>) {
+    if !yes {
+        print!("⚠️  Are you sure to empty trash (permanent delete all)? [y/N]: ");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("✅  Canceled");
+            return;
+        }
+    }
+
+    for (name, meta) in metadata.drain() {
+        let _ = remove_path(&meta.trash_path);
+        println!("🗑️  Deleted: {}", name);
+    }
+    println!("✅  Trash emptied completely!");
 }
 
 fn main() {
@@ -116,9 +492,7 @@ fn main() {
     fs::create_dir_all(&trash_dir).expect("Failed to create trash directory");
 
     let mut metadata = load_metadata(&meta_file);
-
-    // 自动清理过期文件
-    clean_expired_files(&mut metadata, false);
+    clean_trash(&mut metadata, false);
     save_metadata(&metadata, &meta_file);
 
     let cli = Cli::parse();
@@ -137,305 +511,16 @@ fn main() {
             handle_list(&metadata, expired);
         }
         Commands::Clean { all } => {
-            clean_expired_files(&mut metadata, all);
+            clean_trash(&mut metadata, all);
             println!("Clean completed!");
         }
         Commands::Expire { name } => {
-            handle_expire_check(&name, &metadata);
+            handle_expire(&name, &metadata);
         }
         Commands::Empty { yes } => {
-            handle_empty_trash(yes, &mut metadata);
+            handle_empty(yes, &mut metadata);
         }
     }
 
     save_metadata(&metadata, &meta_file);
-}
-
-fn load_metadata(meta_file: &Path) -> HashMap<String, FileMeta> {
-    if meta_file.exists() {
-        let content = fs::read_to_string(meta_file).unwrap_or_else(|_| {
-            eprintln!("Warning: Failed to read metadata, create new");
-            "{}".to_string()
-        });
-        serde_json::from_str(&content).unwrap_or_else(|_| {
-            eprintln!("Warning: Metadata corrupted, reset to empty");
-            HashMap::new()
-        })
-    } else {
-        HashMap::new()
-    }
-}
-
-fn save_metadata(metadata: &HashMap<String, FileMeta>, meta_file: &Path) {
-    let content = serde_json::to_string_pretty(metadata).expect("Failed to serialize metadata");
-    fs::write(meta_file, content).expect("Failed to write metadata");
-}
-
-fn handle_delete(
-    path: &Path,
-    expire_days: i64,
-    force: bool,
-    trash_dir: &Path,
-    metadata: &mut HashMap<String, FileMeta>,
-) {
-    let system_paths = ["/bin", "/sbin", "/etc", "/usr", "/lib", "/lib64", "/root", "/boot"];
-    let path_abs = match fs::canonicalize(path) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("⚠️  Skip '{}': Failed to get absolute path: {}", path.display(), e);
-            return;
-        }
-    };
-
-    if !path_abs.exists() {
-        eprintln!("⚠️  Skip '{}': File/dir not found", path.display());
-        return;
-    }
-
-    let path_str = path_abs.to_str().unwrap_or("");
-    if !force && system_paths.iter().any(|p| path_str.starts_with(p)) {
-        eprintln!("❌  Skip '{}': System directory protected (use -f to force)", path.display());
-        return;
-    }
-
-    let is_dir = path_abs.is_dir();
-    let file_name = path_abs.file_name().unwrap().to_str().unwrap();
-    let timestamp = Local::now().timestamp();
-    let trash_file_name = format!("{}_{}", file_name, timestamp);
-    let trash_path = trash_dir.join(&trash_file_name);
-
-    println!("📤 Moving '{}' to trash (expire in {} days)...", path.display(), expire_days);
-
-    let success = if is_dir {
-        // 复制整个目录
-        if let Err(e) = copy_dir_all(&path_abs, &trash_path) {
-            eprintln!("❌  Failed to copy dir '{}': {}", path.display(), e);
-            return;
-        }
-        // 删除原目录
-        if let Err(e) = fs::remove_dir_all(&path_abs) {
-            // 回滚：删除 trash 中的副本
-            let _ = fs::remove_dir_all(&trash_path);
-            eprintln!("❌  Failed to remove original dir '{}': {}", path.display(), e);
-            return;
-        }
-        true
-    } else {
-        // 复制文件
-        if let Err(e) = fs::copy(&path_abs, &trash_path) {
-            eprintln!("❌  Failed to copy file '{}': {}", path.display(), e);
-            return;
-        }
-        // 删除原文件
-        if let Err(e) = fs::remove_file(&path_abs) {
-            let _ = fs::remove_file(&trash_path);
-            eprintln!("❌  Failed to remove original file '{}': {}", path.display(), e);
-            return;
-        }
-        true
-    };
-
-    if success {
-        println!("✅  Moved to trash: {}", trash_path.display());
-        let delete_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        metadata.insert(
-            trash_file_name,
-            FileMeta {
-                original_path: path_abs,
-                trash_path,
-                delete_time,
-                expire_days,
-                is_dir,
-            },
-        );
-    }
-}
-
-fn handle_restore(
-    name: &str,
-    force: bool,
-    metadata: &mut HashMap<String, FileMeta>,
-) {
-    let Some(meta) = metadata.remove(name) else {
-        eprintln!("❌  Restore '{}': Not found in trash", name);
-        return;
-    };
-
-    if !meta.trash_path.exists() {
-        eprintln!("❌  Restore '{}': Trash file not found", name);
-        metadata.insert(name.to_string(), meta);
-        return;
-    }
-
-    if meta.original_path.exists() && !force {
-        eprintln!("❌  Restore '{}': Target '{}' exists (use -f to force)", name, meta.original_path.display());
-        metadata.insert(name.to_string(), meta);
-        return;
-    }
-
-    // 如果目标存在且 force=true，先删除
-    if force && meta.original_path.exists() {
-        let _ = if meta.is_dir {
-            fs::remove_dir_all(&meta.original_path)
-        } else {
-            fs::remove_file(&meta.original_path)
-        };
-    }
-
-    println!("🔄 Restoring '{}' to '{}'...", name, meta.original_path.display());
-
-    let success = if meta.is_dir {
-        if let Err(e) = restore_dir_all(&meta.trash_path, &meta.original_path) {
-            eprintln!("❌  Failed to restore dir '{}': {}", name, e);
-            false
-        } else {
-            // 删除 trash 中的副本
-            fs::remove_dir_all(&meta.trash_path).is_ok()
-        }
-    } else {
-        if let Err(e) = fs::copy(&meta.trash_path, &meta.original_path) {
-            eprintln!("❌  Failed to restore file '{}': {}", name, e);
-            false
-        } else {
-            fs::remove_file(&meta.trash_path).is_ok()
-        }
-    };
-
-    if !success {
-        eprintln!("❌  Failed to complete restore '{}'", name);
-        // 不加回元数据（因为 trash 文件可能已部分删除）
-        return;
-    }
-
-    println!("✅  Restored: {}", meta.original_path.display());
-}
-
-fn handle_list(metadata: &HashMap<String, FileMeta>, expired: bool) {
-    if metadata.is_empty() {
-        println!("🗑️  Trash is empty");
-        return;
-    }
-
-    println!("=== Safe-RM Trash List (Total: {}) ===", metadata.len());
-    let now = Local::now();
-
-    for (name, meta) in metadata {
-        if expired {
-            let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
-            let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-            let expire_time = delete_time + Duration::days(meta.expire_days);
-            if now <= expire_time {
-                continue;
-            }
-        }
-
-        let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
-        let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-        let expire_time = delete_time + Duration::days(meta.expire_days);
-        let remaining = expire_time.signed_duration_since(now);
-        let remaining_str = if remaining.num_days() > 0 {
-            format!("{} days left", remaining.num_days())
-        } else if remaining.num_hours() > 0 {
-            format!("{} hours left", remaining.num_hours())
-        } else {
-            "Expired".to_string()
-        };
-
-        println!("▶ Name: {}", name);
-        println!("  Type: {}", if meta.is_dir { "Directory" } else { "File" });
-        println!("  Original: {}", meta.original_path.display());
-        println!("  Delete Time: {}", meta.delete_time);
-        println!("  Expire: {} ({})", meta.expire_days, remaining_str);
-        println!("---------------------------");
-    }
-}
-
-fn clean_expired_files(metadata: &mut HashMap<String, FileMeta>, clean_all: bool) {
-    let now = Local::now();
-    let mut to_remove = Vec::new();
-
-    for (name, meta) in metadata.iter() {
-        if clean_all {
-            to_remove.push(name.clone());
-            continue;
-        }
-
-        let delete_time = match NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S") {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("⚠️  Clean '{}': Invalid delete time: {}", name, e);
-                to_remove.push(name.clone());
-                continue;
-            }
-        };
-
-        let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-        let expire_time = delete_time + Duration::days(meta.expire_days);
-        if now > expire_time {
-            to_remove.push(name.clone());
-        }
-    }
-
-    for name in to_remove {
-        if let Some(meta) = metadata.get(&name) {
-            if meta.trash_path.exists() {
-                let _ = if meta.is_dir {
-                    fs::remove_dir_all(&meta.trash_path)
-                } else {
-                    fs::remove_file(&meta.trash_path)
-                };
-            }
-            metadata.remove(&name);
-            println!("🗑️  Cleaned: {}", name);
-        }
-    }
-}
-
-fn handle_expire_check(name: &str, metadata: &HashMap<String, FileMeta>) {
-    let Some(meta) = metadata.get(name) else {
-        eprintln!("❌  '{}' not found in trash", name);
-        return;
-    };
-
-    let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
-    let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-    let expire_time = delete_time + Duration::days(meta.expire_days);
-    let now = Local::now();
-    let remaining = expire_time.signed_duration_since(now);
-
-    println!("=== Expire Info for '{}' ===", name);
-    println!("Original Path: {}", meta.original_path.display());
-    println!("Delete Time: {}", meta.delete_time);
-    println!("Expire Time: {}", expire_time.format("%Y-%m-%d %H:%M:%S"));
-    if remaining.num_seconds() > 0 {
-        println!("Remaining Time: {} days, {} hours", remaining.num_days(), remaining.num_hours() % 24);
-    } else {
-        println!("Status: Expired ({} hours ago)", -remaining.num_hours());
-    }
-}
-
-fn handle_empty_trash(yes: bool, metadata: &mut HashMap<String, FileMeta>) {
-    if !yes {
-        print!("⚠️  Are you sure to empty trash (permanent delete all)? [y/N]: ");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("✅  Canceled");
-            return;
-        }
-    }
-
-    for (name, meta) in metadata.drain() {
-        if meta.trash_path.exists() {
-            let _ = if meta.is_dir {
-                fs::remove_dir_all(&meta.trash_path)
-            } else {
-                fs::remove_file(&meta.trash_path)
-            };
-        }
-        println!("🗑️  Deleted: {}", name);
-    }
-
-    println!("✅  Trash emptied completely!");
 }
