@@ -1,123 +1,111 @@
 # 工作流名称
-name: Build & Release Binary
+name: Build & Release Static Binary
 
 # 触发条件：master分支推送、Tag推送（v开头）、手动触发
 on:
   push:
-    branches: [master]          # master分支推送触发（仅构建，不上传Releases）
-    tags: ['v*']                # Tag推送触发（构建+发布到Releases）
-  workflow_dispatch:            # 手动触发（测试用）
+    branches: [master]
+    tags: ['v*']
+  workflow_dispatch:
 
-# 核心权限配置（必须，否则无法发布Releases）
+# 核心权限配置（发布Releases必需）
 permissions:
-  contents: write               # 允许创建/上传Releases资产
-  packages: write               # 可选：发布GitHub Packages
-  actions: read                 # 读取工作流信息
-  id-token: write               # 2025兼容：OIDC认证（可选）
+  contents: write
+  packages: write
+  actions: read
 
 # 构建任务
 jobs:
-  # Linux x86_64 二进制构建
-  build-linux-x86_64:
-    name: Build Linux x86_64 Binary
-    runs-on: ubuntu-22.04       # 稳定的编译环境
+  build-linux-x86_64-static:
+    name: Build Linux x86_64 Static Binary
+    runs-on: ubuntu-22.04
     steps:
-      # 步骤1：拉取源码（必须）
+      # 步骤1：拉取源码
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1        # 仅拉取最新提交，加快速度
+          fetch-depth: 1
 
-      # 步骤2：安装Rust工具链（指定稳定版）
+      # 步骤2：安装Rust工具链（含musl静态编译目标）
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable     # 使用稳定版Rust
-          target: x86_64-unknown-linux-gnu  # 编译目标架构
-          components: rustfmt, clippy        # 可选：代码格式化/检查工具
+          toolchain: stable
+          target: x86_64-unknown-linux-musl  # 静态编译目标
+          components: rustfmt, clippy
 
-      # 步骤3：安装系统依赖（解决编译/压缩依赖）
+      # 步骤3：安装系统依赖（静态编译必需）
       - name: Install System Dependencies
         run: |
           sudo apt update -y
-          # 必装：C编译工具链（解决linker 'cc' not found错误）
-          sudo apt install -y build-essential
-          # 必装：UPX（压缩二进制体积）
-          sudo apt install -y upx
-          # 可选：验证依赖安装
-          cc --version
-          upx --version
+          sudo apt install -y build-essential musl-tools  # musl工具链（静态编译）
+          # 验证依赖
+          musl-gcc --version
 
-      # 步骤4：高性能编译二进制（核心步骤）
-      - name: Build Optimized Binary
+      # 步骤4：静态编译二进制（禁用UPX，确保功能完整）
+      - name: Build Static Optimized Binary
         run: |
-          # 编译命令：启用CPU原生优化+发布模式+指定目标架构
-          RUSTFLAGS="-C target-cpu=native" cargo build --release --target x86_64-unknown-linux-gnu
+          # 静态编译命令：启用CPU原生优化+静态链接+发布模式
+          RUSTFLAGS="-C target-cpu=native -C link-arg=-static" \
+          cargo build --release --target x86_64-unknown-linux-musl
           
-          # 强制验证二进制是否生成（失败则终止流程）
+          # 强制验证二进制生成
           echo "=== 验证编译产物 ==="
-          ls -lh target/x86_64-unknown-linux-gnu/release/
-          if [ ! -f "target/x86_64-unknown-linux-gnu/release/safe-rm" ]; then
+          ls -lh target/x86_64-unknown-linux-musl/release/
+          if [ ! -f "target/x86_64-unknown-linux-musl/release/safe-rm" ]; then
             echo "错误：二进制文件未生成！"
             exit 1
           fi
           
-          # 查看二进制文件信息（验证架构）
-          file target/x86_64-unknown-linux-gnu/release/safe-rm
-          
-          # UPX压缩（减小体积，失败不终止）
-          echo "=== 压缩二进制文件 ==="
-          upx --best --lzma --ultra-brute target/x86_64-unknown-linux-gnu/release/safe-rm || echo "UPX压缩跳过（非关键错误）"
+          # 验证静态链接（关键：确保无系统依赖）
+          file target/x86_64-unknown-linux-musl/release/safe-rm
+          # 正常输出应包含：statically linked
 
-      # 步骤5：打包二进制+生成校验和（统一命名）
+      # 步骤5：打包二进制+生成校验和
       - name: Package Binary & Generate Checksum
         run: |
-          # 创建发布目录
           mkdir -p release
           
-          # 获取版本号（直接使用Tag名称，确保和Releases匹配）
+          # 版本号处理（Tag推送用Tag名，非Tag用dev+提交哈希）
           VERSION="${{ github.ref_name }}"
-          # 非Tag推送时，版本号为dev+提交哈希
           if [[ "${{ github.ref }}" != refs/tags/* ]]; then
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
           
-          # 复制二进制文件并命名（格式：safe-rm-版本-系统-架构）
-          BIN_NAME="safe-rm-${VERSION}-linux-x86_64"
-          cp target/x86_64-unknown-linux-gnu/release/safe-rm release/${BIN_NAME}
+          # 复制并命名静态二进制（标注static）
+          BIN_NAME="safe-rm-${VERSION}-linux-x86_64-static"
+          cp target/x86_64-unknown-linux-musl/release/safe-rm release/${BIN_NAME}
           
-          # 生成SHA256校验和（用户验证文件完整性）
+          # 生成SHA256校验和
           sha256sum release/${BIN_NAME} > release/${BIN_NAME}.sha256
           
-          # 输出最终打包结果（便于日志排查）
+          # 输出打包结果
           echo "=== 最终打包文件 ==="
           ls -lh release/
           cat release/${BIN_NAME}.sha256
 
-      # 步骤6：上传二进制到Artifact（便于手动下载，所有触发条件都执行）
+      # 步骤6：上传Artifact（便于手动下载）
       - name: Upload Binary to Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: safe-rm-linux-x86_64-${{ github.ref_name }}
+          name: safe-rm-linux-x86_64-static-${{ github.ref_name }}
           path: release/
-          retention-days: 30  # 保留30天
+          retention-days: 30
 
-      # 步骤7：发布到GitHub Releases（仅Tag推送时执行）
+      # 步骤7：发布到GitHub Releases（仅Tag推送）
       - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/')  # 仅Tag触发
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          # 发布的文件（和打包的文件名100%匹配）
           files: |
-            release/safe-rm-${{ github.ref_name }}-linux-x86_64
-            release/safe-rm-${{ github.ref_name }}-linux-x86_64.sha256
-          # 发布配置
-          generate_release_notes: true  # 自动生成发布说明
-          prerelease: false             # 标记为正式发布（非预发布）
-          name: "Release ${{ github.ref_name }}"  # 发布标题（和Tag一致）
-          tag_name: ${{ github.ref_name }}        # Tag名称（和推送的Tag一致）
+            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static
+            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static.sha256
+          generate_release_notes: true
+          prerelease: false
+          name: "Release ${{ github.ref_name }} (Static Binary)"
+          tag_name: ${{ github.ref_name }}
 
-  # 可选：Windows/macOS 构建（如需可取消注释）
+  # 可选：Windows x86_64 构建（如需可取消注释）
   # build-windows-x86_64:
   #   name: Build Windows x86_64 Binary
   #   runs-on: windows-2022
