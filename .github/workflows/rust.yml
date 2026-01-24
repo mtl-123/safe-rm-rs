@@ -1,12 +1,13 @@
 name: Build & Release Binary
 
-# 触发条件：Tag推送（仅Tag触发发布，避免master分支频繁构建）
+# 触发条件：master分支推送、Tag推送、手动触发
 on:
   push:
-    tags: ['v*']  # 仅在打Tag时触发（如v1.0.0）
-  workflow_dispatch:  # 允许手动触发测试
+    branches: [master]
+    tags: ['v*']  # 匹配 v1.0.0、v1.1.0 等Tag
+  workflow_dispatch:  # 手动触发
 
-# 核心权限：必须包含contents.write（发布Releases）
+# 核心权限（必须，否则无法发布Releases）
 permissions:
   contents: write
   packages: write
@@ -15,86 +16,71 @@ permissions:
 jobs:
   build-linux:
     name: Build Linux x86_64 Binary
-    runs-on: ubuntu-22.04  # 稳定的编译环境
+    runs-on: ubuntu-22.04
     steps:
-      # 步骤1：拉取源码（必须）
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      # 步骤2：安装Rust环境（指定版本，避免兼容性问题）
-      - name: Install Rust
+      - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
           target: x86_64-unknown-linux-gnu
 
-      # 步骤3：安装UPX（可选，压缩二进制）
-      - name: Install UPX (Compression)
-        run: sudo apt update && sudo apt install -y upx
+      - name: Install System Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential upx  # 解决linker/UPX缺失问题
 
-      # 步骤4：关键！高性能编译二进制文件
       - name: Build Optimized Binary
         run: |
-          # 显式指定编译目标，确保生成二进制
+          # 高性能编译（强制生成二进制）
           RUSTFLAGS="-C target-cpu=native" cargo build --release --target x86_64-unknown-linux-gnu
-          
-          # 验证二进制文件是否生成（关键检查）
-          echo "=== 检查编译产物 ==="
+          # 验证二进制生成（失败则终止）
           ls -lh target/x86_64-unknown-linux-gnu/release/
-          file target/x86_64-unknown-linux-gnu/release/safe-rm
-          
-          # 可选：UPX压缩（减小体积）
-          upx --best --lzma target/x86_64-unknown-linux-gnu/release/safe-rm || echo "UPX压缩失败，跳过"
+          file target/x86_64-unknown-linux-gnu/release/safe-rm || exit 1
+          # UPX压缩（失败不影响流程）
+          upx --best --lzma target/x86_64-unknown-linux-gnu/release/safe-rm || echo "UPX压缩跳过"
 
-      # 步骤5：打包二进制文件（重命名，便于识别）
       - name: Package Binary
         run: |
-          # 创建发布目录
           mkdir -p release
-          # 获取版本号（从Tag中提取）
-          VERSION=${GITHUB_REF#refs/tags/v}
-          # 重命名二进制（带版本+架构）
+          # ========== 修复点1：统一版本变量 ==========
+          # Tag推送时用Tag名称，非Tag时用dev
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"  # dev版本带提交哈希，更易识别
+          fi
+          # 复制二进制并命名（版本+架构）
           cp target/x86_64-unknown-linux-gnu/release/safe-rm release/safe-rm-v${VERSION}-linux-x86_64
-          # 生成校验和（便于用户验证）
+          # 生成SHA256校验和
           sha256sum release/safe-rm-v${VERSION}-linux-x86_64 > release/safe-rm-v${VERSION}-linux-x86_64.sha256
-          # 最终验证
-          echo "=== 最终发布文件 ==="
+          # 输出版本信息（便于日志排查）
+          echo "最终打包版本：v${VERSION}"
           ls -lh release/
 
-      # 步骤6：上传二进制到GitHub Artifacts（便于调试）
-      - name: Upload Binary to Artifacts
+      - name: Upload Artifact（便于手动下载）
         uses: actions/upload-artifact@v4
         with:
           name: safe-rm-linux-x86_64
           path: release/
 
-      # 步骤7：关键！发布二进制到GitHub Releases
+      # ========== 修复点2：统一文件路径变量 ==========
+      # 仅Tag推送时发布到GitHub Releases
       - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          # 明确指定要发布的二进制文件
+          # 匹配打包后的文件名称（和Package Binary步骤一致）
           files: |
             release/safe-rm-v${{ github.ref_name }}-linux-x86_64
             release/safe-rm-v${{ github.ref_name }}-linux-x86_64.sha256
           # 自动生成发布说明
           generate_release_notes: true
-
-      # 步骤8（可选）：发布二进制到GitHub Packages（容器形式）
-      - name: Publish Binary to GitHub Packages
-        run: |
-          # 登录GitHub Packages
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-          
-          # 构建极简Docker镜像（仅包含二进制）
-          cat > Dockerfile << EOF
-          FROM scratch
-          COPY release/safe-rm-v${{ github.ref_name }}-linux-x86_64 /usr/local/bin/safe-rm
-          ENTRYPOINT ["/usr/local/bin/safe-rm"]
-          EOF
-          
-          # 构建并推送镜像
-          docker build -t ghcr.io/mtl-123/safe-rm:v${{ github.ref_name }} -t ghcr.io/mtl-123/safe-rm:latest .
-          docker push ghcr.io/mtl-123/safe-rm:v${{ github.ref_name }}
-          docker push ghcr.io/mtl-123/safe-rm:latest
+          # 可选：标记为正式发布（非预发布）
+          prerelease: false
+          # 可选：发布标题（和Tag一致）
+          name: "v${{ github.ref_name }}"
