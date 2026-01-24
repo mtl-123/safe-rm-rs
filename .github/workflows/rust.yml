@@ -1,86 +1,154 @@
+# 工作流名称
 name: Build & Release Binary
 
-# 触发条件：master分支推送、Tag推送、手动触发
+# 触发条件：master分支推送、Tag推送（v开头）、手动触发
 on:
   push:
-    branches: [master]
-    tags: ['v*']  # 匹配 v1.0.0、v1.1.0 等Tag
-  workflow_dispatch:  # 手动触发
+    branches: [master]          # master分支推送触发（仅构建，不上传Releases）
+    tags: ['v*']                # Tag推送触发（构建+发布到Releases）
+  workflow_dispatch:            # 手动触发（测试用）
 
-# 核心权限（必须，否则无法发布Releases）
+# 核心权限配置（必须，否则无法发布Releases）
 permissions:
-  contents: write
-  packages: write
-  actions: read
+  contents: write               # 允许创建/上传Releases资产
+  packages: write               # 可选：发布GitHub Packages
+  actions: read                 # 读取工作流信息
+  id-token: write               # 2025兼容：OIDC认证（可选）
 
+# 构建任务
 jobs:
-  build-linux:
+  # Linux x86_64 二进制构建
+  build-linux-x86_64:
     name: Build Linux x86_64 Binary
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-22.04       # 稳定的编译环境
     steps:
+      # 步骤1：拉取源码（必须）
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 1        # 仅拉取最新提交，加快速度
 
+      # 步骤2：安装Rust工具链（指定稳定版）
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: stable
-          target: x86_64-unknown-linux-gnu
+          toolchain: stable     # 使用稳定版Rust
+          target: x86_64-unknown-linux-gnu  # 编译目标架构
+          components: rustfmt, clippy        # 可选：代码格式化/检查工具
 
+      # 步骤3：安装系统依赖（解决编译/压缩依赖）
       - name: Install System Dependencies
         run: |
-          sudo apt update
-          sudo apt install -y build-essential upx  # 解决linker/UPX缺失问题
+          sudo apt update -y
+          # 必装：C编译工具链（解决linker 'cc' not found错误）
+          sudo apt install -y build-essential
+          # 必装：UPX（压缩二进制体积）
+          sudo apt install -y upx
+          # 可选：验证依赖安装
+          cc --version
+          upx --version
 
+      # 步骤4：高性能编译二进制（核心步骤）
       - name: Build Optimized Binary
         run: |
-          # 高性能编译（强制生成二进制）
+          # 编译命令：启用CPU原生优化+发布模式+指定目标架构
           RUSTFLAGS="-C target-cpu=native" cargo build --release --target x86_64-unknown-linux-gnu
-          # 验证二进制生成（失败则终止）
+          
+          # 强制验证二进制是否生成（失败则终止流程）
+          echo "=== 验证编译产物 ==="
           ls -lh target/x86_64-unknown-linux-gnu/release/
-          file target/x86_64-unknown-linux-gnu/release/safe-rm || exit 1
-          # UPX压缩（失败不影响流程）
-          upx --best --lzma target/x86_64-unknown-linux-gnu/release/safe-rm || echo "UPX压缩跳过"
-
-      - name: Package Binary
-        run: |
-          mkdir -p release
-          # ========== 修复点1：统一版本变量 ==========
-          # Tag推送时用Tag名称，非Tag时用dev
-          if [[ $GITHUB_REF == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/v}
-          else
-            VERSION="dev-$(git rev-parse --short HEAD)"  # dev版本带提交哈希，更易识别
+          if [ ! -f "target/x86_64-unknown-linux-gnu/release/safe-rm" ]; then
+            echo "错误：二进制文件未生成！"
+            exit 1
           fi
-          # 复制二进制并命名（版本+架构）
-          cp target/x86_64-unknown-linux-gnu/release/safe-rm release/safe-rm-v${VERSION}-linux-x86_64
-          # 生成SHA256校验和
-          sha256sum release/safe-rm-v${VERSION}-linux-x86_64 > release/safe-rm-v${VERSION}-linux-x86_64.sha256
-          # 输出版本信息（便于日志排查）
-          echo "最终打包版本：v${VERSION}"
-          ls -lh release/
+          
+          # 查看二进制文件信息（验证架构）
+          file target/x86_64-unknown-linux-gnu/release/safe-rm
+          
+          # UPX压缩（减小体积，失败不终止）
+          echo "=== 压缩二进制文件 ==="
+          upx --best --lzma --ultra-brute target/x86_64-unknown-linux-gnu/release/safe-rm || echo "UPX压缩跳过（非关键错误）"
 
-      - name: Upload Artifact（便于手动下载）
+      # 步骤5：打包二进制+生成校验和（统一命名）
+      - name: Package Binary & Generate Checksum
+        run: |
+          # 创建发布目录
+          mkdir -p release
+          
+          # 获取版本号（直接使用Tag名称，确保和Releases匹配）
+          VERSION="${{ github.ref_name }}"
+          # 非Tag推送时，版本号为dev+提交哈希
+          if [[ "${{ github.ref }}" != refs/tags/* ]]; then
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          
+          # 复制二进制文件并命名（格式：safe-rm-版本-系统-架构）
+          BIN_NAME="safe-rm-${VERSION}-linux-x86_64"
+          cp target/x86_64-unknown-linux-gnu/release/safe-rm release/${BIN_NAME}
+          
+          # 生成SHA256校验和（用户验证文件完整性）
+          sha256sum release/${BIN_NAME} > release/${BIN_NAME}.sha256
+          
+          # 输出最终打包结果（便于日志排查）
+          echo "=== 最终打包文件 ==="
+          ls -lh release/
+          cat release/${BIN_NAME}.sha256
+
+      # 步骤6：上传二进制到Artifact（便于手动下载，所有触发条件都执行）
+      - name: Upload Binary to Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: safe-rm-linux-x86_64
+          name: safe-rm-linux-x86_64-${{ github.ref_name }}
           path: release/
+          retention-days: 30  # 保留30天
 
-      # ========== 修复点2：统一文件路径变量 ==========
-      # 仅Tag推送时发布到GitHub Releases
+      # 步骤7：发布到GitHub Releases（仅Tag推送时执行）
       - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/')  # 仅Tag触发
         uses: softprops/action-gh-release@v2
         with:
-          # 匹配打包后的文件名称（和Package Binary步骤一致）
+          # 发布的文件（和打包的文件名100%匹配）
           files: |
-            release/safe-rm-v${{ github.ref_name }}-linux-x86_64
-            release/safe-rm-v${{ github.ref_name }}-linux-x86_64.sha256
-          # 自动生成发布说明
-          generate_release_notes: true
-          # 可选：标记为正式发布（非预发布）
-          prerelease: false
-          # 可选：发布标题（和Tag一致）
-          name: "v${{ github.ref_name }}"
+            release/safe-rm-${{ github.ref_name }}-linux-x86_64
+            release/safe-rm-${{ github.ref_name }}-linux-x86_64.sha256
+          # 发布配置
+          generate_release_notes: true  # 自动生成发布说明
+          prerelease: false             # 标记为正式发布（非预发布）
+          name: "Release ${{ github.ref_name }}"  # 发布标题（和Tag一致）
+          tag_name: ${{ github.ref_name }}        # Tag名称（和推送的Tag一致）
+
+  # 可选：Windows/macOS 构建（如需可取消注释）
+  # build-windows-x86_64:
+  #   name: Build Windows x86_64 Binary
+  #   runs-on: windows-2022
+  #   steps:
+  #     - name: Checkout Source Code
+  #       uses: actions/checkout@v4
+  #     - name: Install Rust Toolchain
+  #       uses: dtolnay/rust-toolchain@v1
+  #       with:
+  #         toolchain: stable
+  #         target: x86_64-pc-windows-msvc
+  #     - name: Build Binary
+  #       run: cargo build --release --target x86_64-pc-windows-msvc
+  #     - name: Package Binary
+  #       run: |
+  #         mkdir -p release
+  #         $VERSION="${{ github.ref_name }}"
+  #         if (-not $env:GITHUB_REF.StartsWith('refs/tags/')) {
+  #           $VERSION="dev-$(git rev-parse --short HEAD)"
+  #         }
+  #         Copy-Item target/x86_64-pc-windows-msvc/release/safe-rm.exe release/safe-rm-${VERSION}-windows-x86_64.exe
+  #         Get-FileHash -Algorithm SHA256 release/safe-rm-${VERSION}-windows-x86_64.exe | Format-List | Out-File release/safe-rm-${VERSION}-windows-x86_64.sha256
+  #     - name: Upload Artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: safe-rm-windows-x86_64-${{ github.ref_name }}
+  #         path: release/
+  #     - name: Publish to GitHub Releases
+  #       if: startsWith(github.ref, 'refs/tags/')
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         files: |
+  #           release/safe-rm-${{ github.ref_name }}-windows-x86_64.exe
+  #           release/safe-rm-${{ github.ref_name }}-windows-x86_64.sha256
