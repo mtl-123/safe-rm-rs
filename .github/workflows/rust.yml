@@ -1,464 +1,150 @@
-// 核心依赖导入
-use clap::{Parser, Subcommand};
-use chrono::{Duration, Local, NaiveDateTime, TimeZone};
-use dirs::home_dir;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::time::SystemTime;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+# 工作流名称
+name: Build & Release Static Binary
 
-// 全局中断标志
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+# 触发条件：main分支推送、Tag推送（v开头）、手动触发
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
-// 配置常量
-const DEFAULT_EXPIRE_DAYS: i64 = 7;
-const MAX_LOG_AGE_DAYS: i64 = 30;
-const PROTECTED_PATHS: [&str; 8] = ["/bin", "/sbin", "/etc", "/usr", "/lib", "/lib64", "/root", "/boot"];
+# 核心权限配置（发布Releases必需）
+permissions:
+  contents: write
+  packages: write
+  actions: read
 
-// ==================== 基础路径 ====================
-fn get_srm_base() -> PathBuf {
-    home_dir().expect("Failed to get home directory").join(".srm")
-}
+# 构建任务
+jobs:
+  build-linux-x86_64-static:
+    name: Build Linux x86_64 Static Binary
+    runs-on: ubuntu-22.04
+    steps:
+      # 步骤1：拉取源码
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-// ==================== 日志系统（仅时间轮转） ====================
-#[derive(Serialize, Deserialize, Debug)]
-struct LogEntry {
-    timestamp: String,
-    level: String,
-    message: String,
-    details: Option<serde_json::Value>,
-}
+      # 步骤2：安装Rust工具链（含musl静态编译目标）
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-unknown-linux-musl # 静态编译目标
+          components: rustfmt, clippy
 
-fn log_event(level: &str, message: &str, details: Option<serde_json::Value>) {
-    let base = get_srm_base();
-    let log_path = base.join("srm.log");
-    let _ = fs::create_dir_all(&base);
+      # 步骤3：安装系统依赖（静态编译 + UPX压缩必需）
+      - name: Install System Dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y build-essential musl-tools upx  # 新增upx安装
+          # 验证依赖
+          musl-gcc --version
+          upx --version  # 验证UPX安装成功
 
-    if let Ok(json) = serde_json::to_string(&LogEntry {
-        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
-        level: level.into(),
-        message: message.into(),
-        details,
-    }) {
-        let _ = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| writeln!(f, "{}", json));
-    }
-}
+      # 步骤4：静态编译二进制 + UPX压缩（核心整合）
+      - name: Build Static Optimized Binary & UPX Compress
+        run: |
+          # 静态编译命令：启用CPU原生优化+静态链接+发布模式
+          RUSTFLAGS="-C target-cpu=native -C link-arg=-static" \
+          cargo build --release --target x86_64-unknown-linux-musl
 
-fn rotate_logs(base: &Path) {
-    let log_path = base.join("srm.log");
-    if !log_path.exists() { return; }
-    let cutoff = Local::now() - Duration::days(MAX_LOG_AGE_DAYS);
-    let mut kept = Vec::new();
-    if let Ok(content) = fs::read_to_string(&log_path) {
-        for line in content.lines() {
-            if let Ok(entry) = serde_json::from_str::<LogEntry>(line) {
-                if let Ok(ts) = NaiveDateTime::parse_from_str(&entry.timestamp, "%Y-%m-%d %H:%M:%S%.3f") {
-                    if Local.from_local_datetime(&ts).unwrap() >= cutoff {
-                        kept.push(line.to_string());
-                    }
-                }
-            }
-        }
-    }
-    let _ = fs::write(&log_path, kept.join("\n") + "\n");
-}
+          # 强制验证二进制生成
+          echo "=== 验证编译产物 ==="
+          ls -lh target/x86_64-unknown-linux-musl/release/
+          if [ ! -f "target/x86_64-unknown-linux-musl/release/safe-rm" ]; then
+            echo "错误：二进制文件未生成！"
+            exit 1
+          fi
 
-// ==================== 安全移动（非递归栈实现） ====================
-fn safe_move(src: &Path, dst: &Path) -> io::Result<()> {
-    if fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
+          # 验证静态链接（关键：确保无系统依赖）
+          file target/x86_64-unknown-linux-musl/release/safe-rm
+          # 正常输出应包含：statically linked
 
-    let meta = fs::symlink_metadata(src)?;
-    if meta.is_dir() {
-        fs::create_dir_all(dst)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            safe_move(&entry.path(), &dst.join(entry.file_name()))?;
-        }
-    } else if meta.file_type().is_symlink() {
-        let target = fs::read_link(src)?;
-        std::os::unix::fs::symlink(target, dst)?;
-    } else {
-        fs::copy(src, dst)?;
-    }
+          # 新增：UPX压缩（--best --lzma 参数）
+          echo "=== UPX压缩二进制 ==="
+          upx --best --lzma target/x86_64-unknown-linux-musl/release/safe-rm
+          # 验证压缩后文件仍可执行（非强制，避免压缩不兼容导致流程终止）
+          chmod +x target/x86_64-unknown-linux-musl/release/safe-rm
+          ./target/x86_64-unknown-linux-musl/release/safe-rm --help || echo "UPX压缩后功能验证（非强制）"
 
-    if meta.is_dir() {
-        fs::remove_dir_all(src)
-    } else {
-        fs::remove_file(src)
-    }
-}
+      # 步骤5：打包二进制+生成校验和
+      - name: Package Binary & Generate Checksum
+        run: |
+          mkdir -p release
 
-// ==================== 元数据 ====================
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct FileMeta {
-    original_path: String,
-    trash_path: String,
-    delete_time: String,
-    expire_days: i64,
-    file_type: FileType,
-    permissions: Option<u32>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-}
+          # 版本号处理（Tag推送用Tag名，非Tag用dev+提交哈希）
+          VERSION="${{ github.ref_name }}"
+          if [[ "${{ github.ref }}" != refs/tags/* ]]; then
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-enum FileType {
-    File,
-    Dir,
-    Symlink,
-}
+          # 复制并命名静态二进制（标注static，保留原有命名）
+          BIN_NAME="safe-rm-${VERSION}-linux-x86_64-static"
+          cp target/x86_64-unknown-linux-musl/release/safe-rm release/${BIN_NAME}
 
-fn save_meta(name: &str, meta: &FileMeta, meta_dir: &Path) -> io::Result<()> {
-    fs::write(meta_dir.join(format!("{}.meta", name)), serde_json::to_string_pretty(meta)?)
-}
+          # 生成SHA256校验和
+          sha256sum release/${BIN_NAME} > release/${BIN_NAME}.sha256
 
-fn remove_meta(name: &str, meta_dir: &Path) {
-    let _ = fs::remove_file(meta_dir.join(format!("{}.meta", name)));
-}
+          # 输出打包结果
+          echo "=== 最终打包文件 ==="
+          ls -lh release/
+          cat release/${BIN_NAME}.sha256
 
-fn list_all_meta(meta_dir: &Path) -> HashMap<String, FileMeta> {
-    let mut map = HashMap::new();
-    if let Ok(entries) = fs::read_dir(meta_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str().and_then(|s| s.strip_suffix(".meta")) {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    if let Ok(meta) = serde_json::from_str(&content) {
-                        map.insert(name.to_string(), meta);
-                    }
-                }
-            }
-        }
-    }
-    map
-}
+      # 步骤6：上传Artifact（便于手动下载）
+      - name: Upload Binary to Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: safe-rm-linux-x86_64-static-${{ github.ref_name }}
+          path: release/
+          retention-days: 30
 
-// ==================== 中断处理 ====================
-fn setup_interrupt_handler() {
-    ctrlc::set_handler(|| {
-        println!("\n⚠️  Operation interrupted. Stopping...");
-        log_event("WARN", "User interrupted operation", None);
-        INTERRUPTED.store(true, Ordering::SeqCst);
-    }).ok();
-}
+      # 步骤7：发布到GitHub Releases（仅Tag推送）
+      - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static
+            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static.sha256
+          generate_release_notes: true
+          prerelease: false
+          name: "Release ${{ github.ref_name }} (Static Binary)"
+          tag_name: ${{ github.ref_name }}
 
-// ==================== 删除逻辑 ====================
-fn handle_delete_batch(paths: Vec<PathBuf>, expire_days: i64, force: bool, trash_dir: &Path, meta_dir: &Path) {
-    setup_interrupt_handler();
-    let mut moved: Vec<(String, String, String)> = Vec::new();
-
-    for path in paths {
-        if INTERRUPTED.load(Ordering::SeqCst) { break; }
-        println!("🗑️  Processing: {}", path.display());
-
-        let abs_path = if path.is_absolute() {
-            path
-        } else {
-            match std::env::current_dir() {
-                Ok(cwd) => cwd.join(path),
-                Err(e) => {
-                    eprintln!("⚠️  Skip '{}': Failed to get current directory: {}", path.display(), e);
-                    continue;
-                }
-            }
-        };
-
-        if !abs_path.exists() {
-            eprintln!("⚠️  Skip '{}': Not found", abs_path.display());
-            continue;
-        }
-
-        let meta = match fs::symlink_metadata(&abs_path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("⚠️  Skip '{}': {}", abs_path.display(), e);
-                continue;
-            }
-        };
-
-        let is_symlink = meta.file_type().is_symlink();
-        let file_type = if is_symlink { FileType::Symlink } else if meta.is_dir() { FileType::Dir } else { FileType::File };
-
-        // 系统目录保护（排除用户目录下的同名目录）
-        if !force && !is_symlink {
-            let path_str = abs_path.to_string_lossy();
-            if PROTECTED_PATHS.iter().any(|&p| {
-                path_str.starts_with(p) &&
-                (path_str.len() == p.len() || path_str.as_bytes()[p.len()] == b'/')
-            }) {
-                eprintln!("❌  Skip '{}': Protected system path (use -f to override)", abs_path.display());
-                continue;
-            }
-        }
-
-        let name = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-        let ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-        let trash_name = format!("{}_{}", name, ts);
-        let trash_path = trash_dir.join(&trash_name);
-
-        if safe_move(&abs_path, &trash_path).is_err() {
-            eprintln!("❌  Failed to move '{}'", abs_path.display());
-            continue;
-        }
-
-        let original_str = abs_path.to_string_lossy().into_owned();
-        let trash_str = trash_path.to_string_lossy().into_owned();
-
-        let file_meta = FileMeta {
-            original_path: original_str.clone(),
-            trash_path: trash_str.clone(),
-            delete_time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            expire_days,
-            file_type,
-            permissions: Some(meta.permissions().mode()),
-            uid: Some(meta.uid()),
-            gid: Some(meta.gid()),
-        };
-
-        let _ = save_meta(&trash_name, &file_meta, meta_dir);
-        moved.push((trash_name, original_str, trash_str));
-    }
-
-    if INTERRUPTED.load(Ordering::SeqCst) {
-        println!("\n🔄 Rolling back {} items...", moved.len());
-        for (name, orig_str, trash_str) in moved.into_iter().rev() {
-            let orig_path = PathBuf::from(&orig_str);
-            let trash_path = PathBuf::from(&trash_str);
-            if trash_path.exists() {
-                println!("↩️  Rolling back: {}", orig_path.display());
-                let _ = safe_move(&trash_path, &orig_path);
-                remove_meta(&name, meta_dir);
-            }
-        }
-        println!("✅ Rollback finished.");
-    } else {
-        println!("✅ Deletion completed.");
-    }
-}
-
-// ==================== 恢复逻辑 ====================
-fn confirm_overwrite(path: &Path) -> bool {
-    print!("⚠️  Target '{}' exists. Overwrite? [y/N]: ", path.display());
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).ok();
-    input.trim().eq_ignore_ascii_case("y")
-}
-
-fn handle_restore(names: Vec<String>, force: bool, target: Option<PathBuf>, meta_dir: &Path) {
-    for name in names {
-        let meta_path = meta_dir.join(format!("{}.meta", name));
-        if !meta_path.exists() {
-            eprintln!("❌  '{}' not found in trash", name);
-            continue;
-        }
-
-        let content = match fs::read_to_string(&meta_path) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("❌  Failed to read metadata for '{}': {}", name, e);
-                continue;
-            }
-        };
-
-        let meta: FileMeta = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("❌  Failed to parse metadata for '{}': {}", name, e);
-                continue;
-            }
-        };
-
-        let trash_path = PathBuf::from(&meta.trash_path);
-        if !trash_path.exists() {
-            eprintln!("❌  Trash file missing for '{}'", name);
-            continue;
-        }
-
-        let final_target = if let Some(t) = &target {
-            let t_abs = if t.is_absolute() {
-                t.clone()
-            } else {
-                std::env::current_dir().map(|c| c.join(t)).unwrap_or_else(|_| t.clone())
-            };
-            if t_abs.is_dir() {
-                t_abs.join(Path::new(&meta.original_path).file_name().unwrap())
-            } else {
-                t_abs
-            }
-        } else {
-            PathBuf::from(&meta.original_path)
-        };
-
-        if final_target.exists() {
-            if !force && !confirm_overwrite(&final_target) {
-                println!("✅  Skipped restoring '{}'", name);
-                continue;
-            }
-            let _ = fs::remove_dir_all(&final_target);
-        }
-
-        if safe_move(&trash_path, &final_target).is_err() {
-            eprintln!("❌  Failed to restore '{}'", name);
-            continue;
-        }
-
-        remove_meta(&name, meta_dir);
-
-        if let Some(mode) = meta.permissions {
-            let _ = fs::set_permissions(&final_target, fs::Permissions::from_mode(mode));
-        }
-
-        println!("✅  Restored: {}", final_target.display());
-    }
-}
-
-// ==================== 其他命令 ====================
-fn handle_list(meta_dir: &Path, expired: bool) {
-    let now = Local::now();
-    for (name, meta) in list_all_meta(meta_dir) {
-        let delete_time = Local.from_local_datetime(
-            &NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap()
-        ).unwrap();
-        let expire_time = delete_time + Duration::days(meta.expire_days);
-        if expired && now <= expire_time { continue; }
-        let status = if now > expire_time { "Expired" } else { "Active" };
-        println!("{}: {} ({})", name, meta.original_path, status);
-    }
-}
-
-fn clean_trash(meta_dir: &Path, all: bool) {
-    let now = Local::now();
-    for (name, meta) in list_all_meta(meta_dir) {
-        let should_clean = if all {
-            true
-        } else {
-            let delete_time = Local.from_local_datetime(
-                &NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap()
-            ).unwrap();
-            now > (delete_time + Duration::days(meta.expire_days))
-        };
-        if should_clean {
-            let trash_path = PathBuf::from(&meta.trash_path);
-            let _ = fs::remove_dir_all(&trash_path);
-            remove_meta(&name, meta_dir);
-            println!("🗑️  Cleaned: {}", name);
-        }
-    }
-}
-
-fn handle_empty(yes: bool, trash_dir: &Path, meta_dir: &Path) {
-    if !yes {
-        print!("⚠️  Empty trash permanently? [y/N]: ");
-        io::stdout().flush().ok();
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).ok();
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("✅ Canceled");
-            return;
-        }
-    }
-    let _ = fs::remove_dir_all(trash_dir);
-    let _ = fs::remove_dir_all(meta_dir);
-    fs::create_dir_all(trash_dir).ok();
-    fs::create_dir_all(meta_dir).ok();
-    println!("✅ Trash emptied.");
-}
-
-// ==================== CLI 定义 ====================
-#[derive(Parser, Debug)]
-#[command(
-    name = "srm",
-    author = "Your Name",
-    version = "1.0.0",
-    about = "Safe alternative to rm: move files to trash instead of permanent delete",
-    long_about = r#"srm prevents accidental deletion by moving files to ~/.srm/trash.
-
-💡 Typical Workflow:
-  $ srm del report.pdf             # Move to trash
-  $ srm ls                        # List trashed items
-  $ srm res report.pdf_1735...    # Restore to original path
-  $ srm res report.pdf_1735... -t ~/backup/  # Restore to custom path
-  $ srm cln                       # Clean expired items (>7 days)
-  $ srm empty                     # Permanently empty trash
-
-All operations are logged to ~/.srm/srm.log (retained for 30 days).
-"#
-)]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Commands {
-    #[command(alias = "del", about = "Move files/dirs to trash")]
-    Delete {
-        #[arg(required = true, help = "Paths to delete")]
-        paths: Vec<PathBuf>,
-        #[arg(short = 'd', long, default_value_t = DEFAULT_EXPIRE_DAYS, help = "Expiration days")]
-        expire_days: i64,
-        #[arg(short = 'f', long, help = "Force delete protected paths")]
-        force: bool,
-    },
-    #[command(alias = "res", about = "Restore files from trash")]
-    Restore {
-        #[arg(required = true, help = "Trash names (from `srm ls`)")]
-        names: Vec<String>,
-        #[arg(short = 'f', long, help = "Force overwrite existing files")]
-        force: bool,
-        #[arg(short = 't', long = "target", help = "Custom restore path")]
-        target: Option<PathBuf>,
-    },
-    #[command(alias = "ls", about = "List trash contents")]
-    List {
-        #[arg(long, help = "Only show expired items")]
-        expired: bool,
-    },
-    #[command(alias = "cln", about = "Clean expired items")]
-    Clean {
-        #[arg(short = 'a', long, help = "Clean all items")]
-        all: bool,
-    },
-    #[command(alias = "empty", about = "Permanently empty trash")]
-    Empty {
-        #[arg(short = 'y', long, help = "Skip confirmation")]
-        yes: bool,
-    },
-}
-
-// ==================== 主函数 ====================
-fn main() {
-    let base = get_srm_base();
-    let trash_dir = base.join("trash");
-    let meta_dir = base.join("meta");
-    fs::create_dir_all(&trash_dir).expect("Failed to create trash dir");
-    fs::create_dir_all(&meta_dir).expect("Failed to create meta dir");
-    rotate_logs(&base);
-
-    match Cli::parse().cmd {
-        Commands::Delete { paths, expire_days, force } => {
-            handle_delete_batch(paths, expire_days, force, &trash_dir, &meta_dir);
-        }
-        Commands::Restore { names, force, target } => {
-            handle_restore(names, force, target, &meta_dir);
-        }
-        Commands::List { expired } => handle_list(&meta_dir, expired),
-        Commands::Clean { all } => {
-            clean_trash(&meta_dir, all);
-            println!("✅ Clean completed!");
-        }
-        Commands::Empty { yes } => handle_empty(yes, &trash_dir, &meta_dir),
-    }
-
-    log_event("INFO", "Command completed", None);
-}
+  # 可选：Windows x86_64 构建（如需可取消注释）
+  # build-windows-x86_64:
+  #   name: Build Windows x86_64 Binary
+  #   runs-on: windows-2022
+  #   steps:
+  #     - name: Checkout Source Code
+  #       uses: actions/checkout@v4
+  #     - name: Install Rust Toolchain
+  #       uses: dtolnay/rust-toolchain@v1
+  #       with:
+  #         toolchain: stable
+  #         target: x86_64-pc-windows-msvc
+  #     - name: Build Binary
+  #       run: cargo build --release --target x86_64-pc-windows-msvc
+  #     - name: Package Binary
+  #       run: |
+  #         mkdir -p release
+  #         $VERSION="${{ github.ref_name }}"
+  #         if (-not $env:GITHUB_REF.StartsWith('refs/tags/')) {
+  #           $VERSION="dev-$(git rev-parse --short HEAD)"
+  #         }
+  #         Copy-Item target/x86_64-pc-windows-msvc/release/safe-rm.exe release/safe-rm-${VERSION}-windows-x86_64.exe
+  #         Get-FileHash -Algorithm SHA256 release/safe-rm-${VERSION}-windows-x86_64.exe | Format-List | Out-File release/safe-rm-${VERSION}-windows-x86_64.sha256
+  #     - name: Upload Artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: safe-rm-windows-x86_64-${{ github.ref_name }}
+  #         path: release/
+  #     - name: Publish to GitHub Releases
+  #       if: startsWith(github.ref, 'refs/tags/')
+  #       uses: softprops/action-gh-release@v2
+  #       with:
+  #         files: |
+  #           release/safe-rm-${{ github.ref_name }}-windows-x86_64.exe
+  #           release/safe-rm-${{ github.ref_name }}-windows-x86_64.sha256
