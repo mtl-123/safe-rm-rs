@@ -33,87 +33,91 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt update -y || true
-          sudo apt install -y --no-install-recommends build-essential musl-tools upx-ucl
+          sudo apt install -y --no-install-recommends build-essential musl-tools upx-ucl gh
           musl-gcc --version || echo "musl-gcc ok"
           upx --version || echo "upx ok"
           rustup target add x86_64-unknown-linux-musl || echo "musl target ok"
+          gh --version || echo "gh cli ok"
 
       - name: Build & Compress
         run: |
           set -euo pipefail
-          BIN_NAME="srm"  # 务必替换为你Cargo.toml中的实际二进制名
+          BIN_NAME="srm"  # 保持与Cargo.toml一致的二进制名
           BIN_PATH="target/x86_64-unknown-linux-musl/release/${BIN_NAME}"
 
-          # 编译
+          # 静态编译
           RUSTFLAGS="-C target-cpu=native -C link-arg=-static -C linker=musl-gcc" \
           cargo build --release --target x86_64-unknown-linux-musl
 
-          # 验证产物
+          # 验证编译产物
           ls -lh target/x86_64-unknown-linux-musl/release/
-          if [ ! -f "$BIN_PATH" ]; then echo "Bin missing!"; exit 1; fi
-          if ! file "$BIN_PATH" | grep -qi "statically linked"; then echo "Not static!"; exit 1; fi
+          if [ ! -f "$BIN_PATH" ]; then echo "二进制文件缺失！"; exit 1; fi
+          if ! file "$BIN_PATH" | grep -qi "statically linked"; then echo "非静态链接！"; exit 1; fi
 
-          # UPX压缩
+          # UPX压缩（失败则回滚）
           cp "$BIN_PATH" "${BIN_PATH}.orig"
           upx --best --lzma "$BIN_PATH" || cp "${BIN_PATH}.orig" "$BIN_PATH"
 
-      - name: Package
+      - name: Package (SRM命名)
         id: package
         run: |
           set -euo pipefail
           mkdir -p release
-          BIN_NAME="srm"  # 同上，替换为实际二进制名
+          BIN_NAME="srm"
 
-          # 定义版本号（强制用Tag名，仅Tag推送时执行）
+          # 仅Tag推送时处理发布包
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${{ github.ref_name }}"
-            FINAL_BIN="safe-rm-${VERSION}-linux-x86_64-static"
-            # 复制产物
+            # 核心修改：产物名改为srm开头
+            FINAL_BIN="srm-${VERSION}-linux-x86_64-static"
+            # 复制编译产物并重命名
             cp target/x86_64-unknown-linux-musl/release/${BIN_NAME} release/${FINAL_BIN}
             chmod +x release/${FINAL_BIN}
-            # 生成校验和
+            # 生成校验和（文件名同步修改）
             sha256sum release/${FINAL_BIN} > release/${FINAL_BIN}.sha256
-            # 输出关键信息到步骤输出
+
+            # 输出到步骤变量，供后续使用
             echo "final_bin=release/${FINAL_BIN}" >> $GITHUB_OUTPUT
             echo "final_sum=release/${FINAL_BIN}.sha256" >> $GITHUB_OUTPUT
             echo "version=${VERSION}" >> $GITHUB_OUTPUT
-            # 列出文件（日志可见）
+
+            # 打印产物信息（日志可见）
+            echo "=== 最终产物（SRM命名）==="
             ls -lh release/
+            cat release/${FINAL_BIN}.sha256
           else
-            echo "Not a tag, skip package for release"
+            echo "非Tag推送，跳过发布包处理"
           fi
 
-      - name: Upload Artifact
+      - name: Upload Artifact (SRM命名)
         uses: actions/upload-artifact@v4
         with:
-          name: safe-rm-build-${{ github.sha }}
+          # Artifact名称同步改为srm开头
+          name: ${{ startsWith(github.ref, 'refs/tags/') && format('srm-linux-x86_64-static-{0}', github.ref_name) || format('srm-linux-x86_64-static-dev-{0}', github.sha) }}
           path: release/
           retention-days: 30
 
-      # 发布步骤：极致日志 + 强制验证
-      - name: Publish to Releases
+      - name: Publish to GitHub Releases (SRM命名)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # 安装gh cli（官方工具，比action更稳定）
-          sudo apt install -y gh
           # 验证gh cli权限
           gh auth status
           # 验证产物存在
           if [ ! -f "${{ steps.package.outputs.final_bin }}" ] || [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
-            echo "Release files missing!"
+            echo "发布文件缺失！当前release目录内容："
             ls -lh release/
             exit 1
           fi
-          # 创建Release（gh cli方式，更稳定）
+          # 创建Release（上传srm开头的文件）
           gh release create ${{ steps.package.outputs.version }} \
             --title "Release ${{ steps.package.outputs.version }} (Static Binary)" \
             --generate-notes \
             --repo ${{ github.repository }} \
             ${{ steps.package.outputs.final_bin }} \
             ${{ steps.package.outputs.final_sum }}
-          # 验证发布成功
-          gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }}
+          # 验证发布结果
+          echo "=== 发布成功！Releases文件列表 ==="
+          gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
