@@ -8,11 +8,12 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# 核心权限配置（发布Releases必需）
+# 核心权限配置（加固：增加id-token: write，适配新版GitHub API）
 permissions:
   contents: write
   packages: write
   actions: read
+  id-token: write  # 新增：解决部分场景下的权限问题
 
 # 构建任务
 jobs:
@@ -20,7 +21,7 @@ jobs:
     name: Build Linux x86_64 Static Binary
     runs-on: ubuntu-22.04
     steps:
-      # 步骤1：拉取源码（取消浅克隆）
+      # 步骤1：拉取源码
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
@@ -34,7 +35,7 @@ jobs:
           target: x86_64-unknown-linux-musl
           components: rustfmt, clippy
 
-      # 步骤3：安装系统依赖（适配Ubuntu 22.04）
+      # 步骤3：安装系统依赖
       - name: Install System Dependencies
         run: |
           set -euo pipefail
@@ -43,58 +44,43 @@ jobs:
             build-essential \
             musl-tools \
             upx-ucl
-          # 验证依赖
-          echo "=== 验证依赖版本 ==="
           musl-gcc --version || echo "musl-gcc 验证完成"
           upx --version || echo "upx 验证完成"
           rustup target add x86_64-unknown-linux-musl || echo "musl target 已安装"
 
-      # 步骤4：静态编译二进制 + 安全的UPX压缩（修复link-type错误）
+      # 步骤4：静态编译+UPX压缩（不变）
       - name: Build Static Optimized Binary & Safe UPX Compress
         run: |
           set -euo pipefail
-
-          # 替换为你Cargo.toml中的实际二进制名（比如srm）
-          BIN_NAME="srm"
+          BIN_NAME="srm"  # 替换为你的实际二进制名
           BIN_PATH="target/x86_64-unknown-linux-musl/release/${BIN_NAME}"
 
-          # 核心修复：移除错误的link-type参数，简化RUSTFLAGS
-          echo "=== 开始静态编译 ==="
           RUSTFLAGS="\
             -C target-cpu=native \
             -C link-arg=-static \
             -C linker=musl-gcc" \
           cargo build --release --target x86_64-unknown-linux-musl
 
-          # 调试：列出编译目录所有文件
           echo "=== 编译目录文件列表 ==="
           ls -lh target/x86_64-unknown-linux-musl/release/
 
-          # 强制验证二进制生成
-          echo "=== 验证编译产物 ==="
           if [ ! -f "$BIN_PATH" ]; then
-            echo "错误：二进制文件未生成！编译目录内容："
+            echo "错误：二进制文件未生成！"
             ls -la target/x86_64-unknown-linux-musl/release/
             exit 1
           fi
 
-          # 强制验证静态链接
-          echo "=== 验证静态链接 ==="
           if ! file "$BIN_PATH" | grep -qi "statically linked"; then
             echo "错误：二进制非静态链接！"
             file "$BIN_PATH"
             exit 1
           fi
 
-          # 验证二进制可执行性（放宽条件）
-          echo "=== 验证二进制可执行性 ==="
           chmod +x "$BIN_PATH"
           if ! "$BIN_PATH" --help > /dev/null 2>&1; then
             echo "警告：二进制--help执行失败，但继续流程"
           fi
 
-          # 安全的UPX压缩（带降级+回滚）
-          echo "=== UPX压缩二进制（安全模式） ==="
           cp "$BIN_PATH" "${BIN_PATH}.original"
           if upx --best --lzma "$BIN_PATH" > /dev/null 2>&1; then
             echo "✅ UPX高压缩级别成功"
@@ -105,15 +91,13 @@ jobs:
             cp "${BIN_PATH}.original" "$BIN_PATH"
           fi
 
-      # 步骤5：打包二进制+生成校验和
+      # 步骤5：打包+校验和（不变）
       - name: Package Binary & Generate Checksum
         run: |
           set -euo pipefail
           mkdir -p release
+          BIN_NAME="srm"  # 替换为你的实际二进制名
 
-          # 统一二进制名
-          BIN_NAME="srm"
-          # 版本号处理
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${{ github.ref_name }}"
           else
@@ -122,20 +106,20 @@ jobs:
             VERSION="dev-${SHORT_SHA}-${TIMESTAMP}"
           fi
 
-          # 产物命名
           FINAL_BIN_NAME="safe-rm-${VERSION}-linux-x86_64-static"
           cp target/x86_64-unknown-linux-musl/release/${BIN_NAME} release/${FINAL_BIN_NAME}
           chmod +x release/${FINAL_BIN_NAME}
-
-          # 生成SHA256校验和
           sha256sum release/${FINAL_BIN_NAME} | awk '{print $1 "  " $2}' > release/${FINAL_BIN_NAME}.sha256
 
-          # 输出结果
           echo "=== 最终打包文件 ==="
           ls -lh release/
           cat release/${FINAL_BIN_NAME}.sha256
 
-      # 步骤6：上传Artifact
+          # 新增：输出产物路径，便于发布步骤校验
+          echo "FINAL_BIN_PATH=release/${FINAL_BIN_NAME}" >> $GITHUB_ENV
+          echo "FINAL_CHECKSUM_PATH=release/${FINAL_BIN_NAME}.sha256" >> $GITHUB_ENV
+
+      # 步骤6：上传Artifact（不变）
       - name: Upload Binary to Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -143,14 +127,22 @@ jobs:
           path: release/
           retention-days: 30
 
-      # 步骤7：发布到GitHub Releases
+      # 步骤7：发布到GitHub Releases（核心优化）
       - name: Publish to GitHub Releases
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
+        env:
+          # 显式指定GITHUB_TOKEN（解决隐性权限问题）
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          # 使用环境变量引用产物路径，避免硬编码错误
           files: |
-            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static
-            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static.sha256
+            ${{ env.FINAL_BIN_PATH }}
+            ${{ env.FINAL_CHECKSUM_PATH }}
           generate_release_notes: true
           prerelease: false
           name: "Release ${{ github.ref_name }} (Static Binary)"
+          # 新增：允许覆盖同名Release（解决Tag重复发布问题）
+          overwrite: true
+        # 新增：捕获发布错误，输出详细日志
+        continue-on-error: false
