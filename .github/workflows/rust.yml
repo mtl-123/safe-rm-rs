@@ -1,33 +1,27 @@
-# 工作流名称
 name: Build & Release Static Binary
 
-# 触发条件：master分支推送、Tag推送（v开头）、手动触发
 on:
   push:
     branches: [master]
     tags: ["v*"]
   workflow_dispatch:
 
-# 核心权限配置（加固：增加id-token: write，适配新版GitHub API）
 permissions:
   contents: write
   packages: write
   actions: read
-  id-token: write  # 新增：解决部分场景下的权限问题
+  id-token: write
 
-# 构建任务
 jobs:
   build-linux-x86_64-static:
     name: Build Linux x86_64 Static Binary
     runs-on: ubuntu-22.04
     steps:
-      # 步骤1：拉取源码
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 步骤2：安装Rust工具链
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -35,114 +29,91 @@ jobs:
           target: x86_64-unknown-linux-musl
           components: rustfmt, clippy
 
-      # 步骤3：安装系统依赖
       - name: Install System Dependencies
         run: |
           set -euo pipefail
           sudo apt update -y || true
-          sudo apt install -y --no-install-recommends \
-            build-essential \
-            musl-tools \
-            upx-ucl
-          musl-gcc --version || echo "musl-gcc 验证完成"
-          upx --version || echo "upx 验证完成"
-          rustup target add x86_64-unknown-linux-musl || echo "musl target 已安装"
+          sudo apt install -y --no-install-recommends build-essential musl-tools upx-ucl
+          musl-gcc --version || echo "musl-gcc ok"
+          upx --version || echo "upx ok"
+          rustup target add x86_64-unknown-linux-musl || echo "musl target ok"
 
-      # 步骤4：静态编译+UPX压缩（不变）
-      - name: Build Static Optimized Binary & Safe UPX Compress
+      - name: Build & Compress
         run: |
           set -euo pipefail
-          BIN_NAME="srm"  # 替换为你的实际二进制名
+          BIN_NAME="srm"  # 务必替换为你Cargo.toml中的实际二进制名
           BIN_PATH="target/x86_64-unknown-linux-musl/release/${BIN_NAME}"
 
-          RUSTFLAGS="\
-            -C target-cpu=native \
-            -C link-arg=-static \
-            -C linker=musl-gcc" \
+          # 编译
+          RUSTFLAGS="-C target-cpu=native -C link-arg=-static -C linker=musl-gcc" \
           cargo build --release --target x86_64-unknown-linux-musl
 
-          echo "=== 编译目录文件列表 ==="
+          # 验证产物
           ls -lh target/x86_64-unknown-linux-musl/release/
+          if [ ! -f "$BIN_PATH" ]; then echo "Bin missing!"; exit 1; fi
+          if ! file "$BIN_PATH" | grep -qi "statically linked"; then echo "Not static!"; exit 1; fi
 
-          if [ ! -f "$BIN_PATH" ]; then
-            echo "错误：二进制文件未生成！"
-            ls -la target/x86_64-unknown-linux-musl/release/
-            exit 1
-          fi
+          # UPX压缩
+          cp "$BIN_PATH" "${BIN_PATH}.orig"
+          upx --best --lzma "$BIN_PATH" || cp "${BIN_PATH}.orig" "$BIN_PATH"
 
-          if ! file "$BIN_PATH" | grep -qi "statically linked"; then
-            echo "错误：二进制非静态链接！"
-            file "$BIN_PATH"
-            exit 1
-          fi
-
-          chmod +x "$BIN_PATH"
-          if ! "$BIN_PATH" --help > /dev/null 2>&1; then
-            echo "警告：二进制--help执行失败，但继续流程"
-          fi
-
-          cp "$BIN_PATH" "${BIN_PATH}.original"
-          if upx --best --lzma "$BIN_PATH" > /dev/null 2>&1; then
-            echo "✅ UPX高压缩级别成功"
-          elif upx -6 "$BIN_PATH" > /dev/null 2>&1; then
-            echo "⚠️ UPX高压缩失败，降级到-6级别成功"
-          else
-            echo "❌ UPX压缩失败，使用原始二进制"
-            cp "${BIN_PATH}.original" "$BIN_PATH"
-          fi
-
-      # 步骤5：打包+校验和（不变）
-      - name: Package Binary & Generate Checksum
+      - name: Package
+        id: package
         run: |
           set -euo pipefail
           mkdir -p release
-          BIN_NAME="srm"  # 替换为你的实际二进制名
+          BIN_NAME="srm"  # 同上，替换为实际二进制名
 
+          # 定义版本号（强制用Tag名，仅Tag推送时执行）
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${{ github.ref_name }}"
+            FINAL_BIN="safe-rm-${VERSION}-linux-x86_64-static"
+            # 复制产物
+            cp target/x86_64-unknown-linux-musl/release/${BIN_NAME} release/${FINAL_BIN}
+            chmod +x release/${FINAL_BIN}
+            # 生成校验和
+            sha256sum release/${FINAL_BIN} > release/${FINAL_BIN}.sha256
+            # 输出关键信息到步骤输出
+            echo "final_bin=release/${FINAL_BIN}" >> $GITHUB_OUTPUT
+            echo "final_sum=release/${FINAL_BIN}.sha256" >> $GITHUB_OUTPUT
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            # 列出文件（日志可见）
+            ls -lh release/
           else
-            SHORT_SHA=$(git rev-parse --short HEAD)
-            TIMESTAMP=$(date +%Y%m%d%H%M%S)
-            VERSION="dev-${SHORT_SHA}-${TIMESTAMP}"
+            echo "Not a tag, skip package for release"
           fi
 
-          FINAL_BIN_NAME="safe-rm-${VERSION}-linux-x86_64-static"
-          cp target/x86_64-unknown-linux-musl/release/${BIN_NAME} release/${FINAL_BIN_NAME}
-          chmod +x release/${FINAL_BIN_NAME}
-          sha256sum release/${FINAL_BIN_NAME} | awk '{print $1 "  " $2}' > release/${FINAL_BIN_NAME}.sha256
-
-          echo "=== 最终打包文件 ==="
-          ls -lh release/
-          cat release/${FINAL_BIN_NAME}.sha256
-
-          # 新增：输出产物路径，便于发布步骤校验
-          echo "FINAL_BIN_PATH=release/${FINAL_BIN_NAME}" >> $GITHUB_ENV
-          echo "FINAL_CHECKSUM_PATH=release/${FINAL_BIN_NAME}.sha256" >> $GITHUB_ENV
-
-      # 步骤6：上传Artifact（不变）
-      - name: Upload Binary to Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ startsWith(github.ref, 'refs/tags/') && format('safe-rm-linux-x86_64-static-{0}', github.ref_name) || format('safe-rm-linux-x86_64-static-dev-{0}', github.sha) }}
+          name: safe-rm-build-${{ github.sha }}
           path: release/
           retention-days: 30
 
-      # 步骤7：发布到GitHub Releases（核心优化）
-      - name: Publish to GitHub Releases
+      # 发布步骤：极致日志 + 强制验证
+      - name: Publish to Releases
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
         env:
-          # 显式指定GITHUB_TOKEN（解决隐性权限问题）
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          # 使用环境变量引用产物路径，避免硬编码错误
-          files: |
-            ${{ env.FINAL_BIN_PATH }}
-            ${{ env.FINAL_CHECKSUM_PATH }}
-          generate_release_notes: true
-          prerelease: false
-          name: "Release ${{ github.ref_name }} (Static Binary)"
-          # 新增：允许覆盖同名Release（解决Tag重复发布问题）
-          overwrite: true
-        # 新增：捕获发布错误，输出详细日志
-        continue-on-error: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 安装gh cli（官方工具，比action更稳定）
+          sudo apt install -y gh
+          # 验证gh cli权限
+          gh auth status
+          # 验证产物存在
+          if [ ! -f "${{ steps.package.outputs.final_bin }}" ] || [ ! -f "${{ steps.package.outputs.final_sum }}" ]; then
+            echo "Release files missing!"
+            ls -lh release/
+            exit 1
+          fi
+          # 创建Release（gh cli方式，更稳定）
+          gh release create ${{ steps.package.outputs.version }} \
+            --title "Release ${{ steps.package.outputs.version }} (Static Binary)" \
+            --generate-notes \
+            --repo ${{ github.repository }} \
+            ${{ steps.package.outputs.final_bin }} \
+            ${{ steps.package.outputs.final_sum }}
+          # 验证发布成功
+          gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }}
