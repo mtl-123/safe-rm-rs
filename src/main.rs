@@ -1,4 +1,3 @@
-// 核心依赖导入
 use clap::{Parser, Subcommand};
 use chrono::{Duration, Local, NaiveDateTime, TimeZone};
 use dirs::home_dir;
@@ -8,30 +7,377 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-// 配置常量
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 const DEFAULT_EXPIRE_DAYS: i64 = 7;
-const TRASH_DIR: &str = ".safe-rm/trash";
-const META_FILE: &str = ".safe-rm/metadata.json";
+const MAX_LOG_AGE_DAYS: i64 = 30;
+const PROTECTED_PATHS: [&str; 8] = ["/bin", "/sbin", "/etc", "/usr", "/lib", "/lib64", "/root", "/boot"];
+
+fn get_srm_base() -> PathBuf {
+    home_dir().expect("Failed to get home directory").join(".srm")
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct LogEntry {
+    timestamp: String,
+    level: String,
+    message: String,
+    details: Option<serde_json::Value>,
+}
+
+fn log_event(level: &str, message: &str, details: Option<serde_json::Value>) {
+    let base = get_srm_base();
+    let log_path = base.join("srm.log");
+    let _ = fs::create_dir_all(&base);
+    if let Ok(json) = serde_json::to_string(&LogEntry {
+        timestamp: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        level: level.into(),
+        message: message.into(),
+        details,
+    }) {
+        let _ = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| writeln!(f, "{}", json));
+    }
+}
+
+fn rotate_logs(base: &Path) {
+    let log_path = base.join("srm.log");
+    if !log_path.exists() { return; }
+    let cutoff = Local::now() - Duration::days(MAX_LOG_AGE_DAYS);
+    let mut kept = Vec::new();
+    if let Ok(content) = fs::read_to_string(&log_path) {
+        for line in content.lines() {
+            if let Ok(entry) = serde_json::from_str::<LogEntry>(line) {
+                if let Ok(ts) = NaiveDateTime::parse_from_str(&entry.timestamp, "%Y-%m-%d %H:%M:%S%.3f") {
+                    if Local.from_local_datetime(&ts).unwrap() >= cutoff {
+                        kept.push(line.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let _ = fs::write(&log_path, kept.join("\n") + "\n");
+}
+
+fn safe_move(src: &Path, dst: &Path) -> io::Result<()> {
+    if fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+
+    let meta = fs::symlink_metadata(src)?;
+    if meta.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            safe_move(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+    } else if meta.file_type().is_symlink() {
+        let target = fs::read_link(src)?;
+        std::os::unix::fs::symlink(target, dst)?;
+    } else {
+        fs::copy(src, dst)?;
+    }
+
+    if meta.is_dir() {
+        fs::remove_dir_all(src)
+    } else {
+        fs::remove_file(src)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct FileMeta {
+    original_path: String,
+    trash_path: String,
+    delete_time: String,
+    expire_days: i64,
+    file_type: FileType,
+    permissions: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+enum FileType {
+    File,
+    Dir,
+    Symlink,
+}
+
+fn save_meta(name: &str, meta: &FileMeta, meta_dir: &Path) -> io::Result<()> {
+    fs::write(meta_dir.join(format!("{}.meta", name)), serde_json::to_string_pretty(meta)?)
+}
+
+fn remove_meta(name: &str, meta_dir: &Path) {
+    let _ = fs::remove_file(meta_dir.join(format!("{}.meta", name)));
+}
+
+fn list_all_meta(meta_dir: &Path) -> HashMap<String, FileMeta> {
+    let mut map = HashMap::new();
+    if let Ok(entries) = fs::read_dir(meta_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str().and_then(|s| s.strip_suffix(".meta")) {
+                if let Ok(content) = fs::read_to_string(entry.path()) {
+                    if let Ok(meta) = serde_json::from_str(&content) {
+                        map.insert(name.to_string(), meta);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+fn setup_interrupt_handler() {
+    ctrlc::set_handler(|| {
+        println!("\n⚠️  Operation interrupted. Stopping...");
+        log_event("WARN", "User interrupted operation", None);
+        INTERRUPTED.store(true, Ordering::SeqCst);
+    }).ok();
+}
+
+fn handle_delete_batch(paths: Vec<PathBuf>, expire_days: i64, force: bool, trash_dir: &Path, meta_dir: &Path) {
+    setup_interrupt_handler();
+    let mut moved: Vec<(String, String, String)> = Vec::new();
+
+    for path in paths {
+        if INTERRUPTED.load(Ordering::SeqCst) { break; }
+        println!("🗑️  Processing: {}", path.display());
+
+        let abs_path = if path.is_absolute() {
+            path
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(path),
+                Err(e) => {
+                    eprintln!("⚠️  Skip '{}': Failed to get current directory: {}", path.display(), e);
+                    continue;
+                }
+            }
+        };
+
+        if !abs_path.exists() {
+            eprintln!("⚠️  Skip '{}': Not found", abs_path.display());
+            continue;
+        }
+
+        let meta = match fs::symlink_metadata(&abs_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("⚠️  Skip '{}': {}", abs_path.display(), e);
+                continue;
+            }
+        };
+
+        let is_symlink = meta.file_type().is_symlink();
+        let file_type = if is_symlink { FileType::Symlink } else if meta.is_dir() { FileType::Dir } else { FileType::File };
+
+        if !force && !is_symlink {
+            let path_str = abs_path.to_string_lossy();
+            if PROTECTED_PATHS.iter().any(|&p| {
+                path_str.starts_with(p) &&
+                (path_str.len() == p.len() || path_str.as_bytes()[p.len()] == b'/')
+            }) {
+                eprintln!("❌  Skip '{}': Protected system path (use -f to override)", abs_path.display());
+                continue;
+            }
+        }
+
+        let name = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+        let ts = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let trash_name = format!("{}_{}", name, ts);
+        let trash_path = trash_dir.join(&trash_name);
+
+        if safe_move(&abs_path, &trash_path).is_err() {
+            eprintln!("❌  Failed to move '{}'", abs_path.display());
+            continue;
+        }
+
+        let original_str = abs_path.to_string_lossy().into_owned();
+        let trash_str = trash_path.to_string_lossy().into_owned();
+
+        let file_meta = FileMeta {
+            original_path: original_str.clone(),
+            trash_path: trash_str.clone(),
+            delete_time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            expire_days,
+            file_type,
+            permissions: Some(meta.permissions().mode()),
+            uid: Some(meta.uid()),
+            gid: Some(meta.gid()),
+        };
+
+        let _ = save_meta(&trash_name, &file_meta, meta_dir);
+        moved.push((trash_name, original_str, trash_str));
+    }
+
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        println!("\n🔄 Rolling back {} items...", moved.len());
+        for (name, orig_str, trash_str) in moved.into_iter().rev() {
+            let orig_path = PathBuf::from(&orig_str);
+            let trash_path = PathBuf::from(&trash_str);
+            if trash_path.exists() {
+                println!("↩️  Rolling back: {}", orig_path.display());
+                let _ = safe_move(&trash_path, &orig_path);
+                remove_meta(&name, meta_dir);
+            }
+        }
+        println!("✅ Rollback finished.");
+    } else {
+        println!("✅ Deletion completed.");
+    }
+}
+
+fn confirm_overwrite(path: &Path) -> bool {
+    print!("⚠️  Target '{}' exists. Overwrite? [y/N]: ", path.display());
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    input.trim().eq_ignore_ascii_case("y")
+}
+
+fn handle_restore(names: Vec<String>, force: bool, target: Option<PathBuf>, meta_dir: &Path) {
+    for name in names {
+        let meta_path = meta_dir.join(format!("{}.meta", name));
+        if !meta_path.exists() {
+            eprintln!("❌  '{}' not found in trash", name);
+            continue;
+        }
+
+        let content = match fs::read_to_string(&meta_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("❌  Failed to read metadata for '{}': {}", name, e);
+                continue;
+            }
+        };
+
+        let meta: FileMeta = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("❌  Failed to parse metadata for '{}': {}", name, e);
+                continue;
+            }
+        };
+
+        let trash_path = PathBuf::from(&meta.trash_path);
+        if !trash_path.exists() {
+            eprintln!("❌  Trash file missing for '{}'", name);
+            continue;
+        }
+
+        let final_target = if let Some(t) = &target {
+            let t_abs = if t.is_absolute() {
+                t.clone()
+            } else {
+                std::env::current_dir().map(|c| c.join(t)).unwrap_or_else(|_| t.clone())
+            };
+            if t_abs.is_dir() {
+                t_abs.join(Path::new(&meta.original_path).file_name().unwrap())
+            } else {
+                t_abs
+            }
+        } else {
+            PathBuf::from(&meta.original_path)
+        };
+
+        if final_target.exists() {
+            if !force && !confirm_overwrite(&final_target) {
+                println!("✅  Skipped restoring '{}'", name);
+                continue;
+            }
+            let _ = fs::remove_dir_all(&final_target);
+        }
+
+        if safe_move(&trash_path, &final_target).is_err() {
+            eprintln!("❌  Failed to restore '{}'", name);
+            continue;
+        }
+
+        remove_meta(&name, meta_dir);
+
+        if let Some(mode) = meta.permissions {
+            let _ = fs::set_permissions(&final_target, fs::Permissions::from_mode(mode));
+        }
+
+        println!("✅  Restored: {}", final_target.display());
+    }
+}
+
+fn handle_list(meta_dir: &Path, expired: bool) {
+    let now = Local::now();
+    for (name, meta) in list_all_meta(meta_dir) {
+        let delete_time = Local.from_local_datetime(
+            &NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap()
+        ).unwrap();
+        let expire_time = delete_time + Duration::days(meta.expire_days);
+        if expired && now <= expire_time { continue; }
+        let status = if now > expire_time { "Expired" } else { "Active" };
+        println!("{}: {} ({})", name, meta.original_path, status);
+    }
+}
+
+fn clean_trash(meta_dir: &Path, all: bool) {
+    let now = Local::now();
+    for (name, meta) in list_all_meta(meta_dir) {
+        let should_clean = if all {
+            true
+        } else {
+            let delete_time = Local.from_local_datetime(
+                &NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap()
+            ).unwrap();
+            now > (delete_time + Duration::days(meta.expire_days))
+        };
+        if should_clean {
+            let trash_path = PathBuf::from(&meta.trash_path);
+            let _ = fs::remove_dir_all(&trash_path);
+            remove_meta(&name, meta_dir);
+            println!("🗑️  Cleaned: {}", name);
+        }
+    }
+}
+
+fn handle_empty(yes: bool, trash_dir: &Path, meta_dir: &Path) {
+    if !yes {
+        print!("⚠️  Empty trash permanently? [y/N]: ");
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).ok();
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("✅ Canceled");
+            return;
+        }
+    }
+    let _ = fs::remove_dir_all(trash_dir);
+    let _ = fs::remove_dir_all(meta_dir);
+    fs::create_dir_all(trash_dir).ok();
+    fs::create_dir_all(meta_dir).ok();
+    println!("✅ Trash emptied.");
+}
 
 #[derive(Parser, Debug)]
 #[command(
-    author = "Your Name <your.email@example.com>",
+    name = "srm",
+    author = "Your Name",
     version = "1.0.0",
     about = "Safe alternative to rm: move files to trash instead of permanent delete",
-    long_about = r#"Safe rm (safe-rm) is a secure replacement for the native rm command that prevents accidental permanent file deletion.
-Key features:
-1. Moves files/directories to a trash directory (~/.safe-rm/trash) instead of deleting them
-2. Supports restoring deleted files to their original paths
-3. Auto-cleans expired files (default: 7 days)
-4. Protects system directories from accidental deletion
-5. Handles symlinks, regular files, and directories correctly
+    long_about = r#"srm prevents accidental deletion by moving files to ~/.srm/trash.
 
-Basic usage:
-  safe-rm del <file>          # Move file to trash
-  safe-rm ls                  # List trash contents
-  safe-rm res <trash-name>    # Restore file from trash
-  safe-rm cln                 # Clean expired files
+💡 Typical Workflow:
+  $ srm del report.pdf             # Move to trash
+  $ srm ls                        # List trashed items
+  $ srm res report.pdf_1735...    # Restore to original path
+  $ srm res report.pdf_1735... -t ~/backup/  # Restore to custom path
+  $ srm cln                       # Clean expired items (>7 days)
+  $ srm empty                     # Permanently empty trash
+
+All operations are logged to ~/.srm/srm.log (retained for 30 days).
 "#
 )]
 struct Cli {
@@ -41,486 +387,63 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    #[command(
-        alias = "del",
-        about = "Move files/directories to trash (recursive support)",
-        long_about = r#"Move specified files or directories to the trash directory (~/.safe-rm/trash).
-Files are not permanently deleted and can be restored later.
-Supports batch deletion of multiple paths and custom expiration days.
-System directories (e.g., /bin, /usr, /root) are protected by default - use -f to override.
-Symlinks are handled as-is (only the link is moved, not the target)."#
-    )]
+    #[command(alias = "del", about = "Move files/dirs to trash")]
     Delete {
-        #[arg(
-            required = true,
-            help = "One or more paths to files/directories to move to trash",
-            long_help = "Path(s) to the file or directory you want to delete (move to trash). Multiple paths can be specified separated by spaces."
-        )]
+        #[arg(required = true, help = "Paths to delete")]
         paths: Vec<PathBuf>,
-
-        #[arg(
-            short = 'd',
-            long,
-            default_value_t = DEFAULT_EXPIRE_DAYS,
-            help = "Number of days until the file expires (default: 7)",
-            long_help = "Set custom expiration days for the deleted files. After this period, the files will be automatically cleaned up from the trash. Default value is 7 days."
-        )]
+        #[arg(short = 'd', long, default_value_t = DEFAULT_EXPIRE_DAYS, help = "Expiration days")]
         expire_days: i64,
-
-        #[arg(
-            short = 'f',
-            long,
-            help = "Force delete - skip system directory protection check",
-            long_help = "Force deletion of files in protected system directories (/bin, /sbin, /etc, /usr, /lib, /lib64, /root, /boot). Use this option with extreme caution as it may damage your system."
-        )]
+        #[arg(short = 'f', long, help = "Force delete protected paths")]
         force: bool,
     },
-
-    #[command(
-        alias = "res",
-        about = "Restore files/directories from trash to original path",
-        long_about = r#"Restore specified items from the trash directory back to their original locations.
-Requires the trash name (from `safe-rm list` output) as input.
-By default, will not overwrite existing files at the target path - use -f to force overwrite.
-Supports batch restoration of multiple trash items."#
-    )]
+    #[command(alias = "res", about = "Restore files from trash")]
     Restore {
-        #[arg(
-            required = true,
-            help = "One or more trash names to restore (from `safe-rm list`)",
-            long_help = "Trash name(s) of the files/directories to restore. These names are generated by safe-rm (e.g., 'file.txt_1735689000000000000') and can be listed with `safe-rm list`."
-        )]
+        #[arg(required = true, help = "Trash names (from `srm ls`)")]
         names: Vec<String>,
-
-        #[arg(
-            short = 'f',
-            long,
-            help = "Force restore - overwrite existing files at target path",
-            long_help = "Force restoration even if a file/directory already exists at the original path. This will overwrite the existing file/directory with the one from trash."
-        )]
+        #[arg(short = 'f', long, help = "Force overwrite existing files")]
         force: bool,
+        #[arg(short = 't', long = "target", help = "Custom restore path")]
+        target: Option<PathBuf>,
     },
-
-    #[command(
-        alias = "ls",
-        about = "List all items in the trash directory with details",
-        long_about = r#"List all files and directories currently in the trash (~/.safe-rm/trash).
-Shows detailed information including:
-- Trash name (used for restoration)
-- File type (File/Directory/Symlink)
-- Original path
-- Deletion time
-- Expiration days and remaining time until expiration
-Use --expired to filter only items that have passed their expiration date."#
-    )]
+    #[command(alias = "ls", about = "List trash contents")]
     List {
-        #[arg(
-            long,
-            help = "Only show expired items in trash",
-            long_help = "Filter the list to show only items that have passed their expiration date and are eligible for automatic cleanup."
-        )]
+        #[arg(long, help = "Only show expired items")]
         expired: bool,
     },
-
-    #[command(
-        alias = "cln",
-        about = "Clean expired items from trash",
-        long_about = r#"Manually clean up items from the trash directory.
-By default, only removes items that have expired (based on their expiration days).
-Use --all to remove ALL items from trash (ignores expiration status) - use with caution."#
-    )]
+    #[command(alias = "cln", about = "Clean expired items")]
     Clean {
-        #[arg(
-            short = 'a',
-            long,
-            help = "Clean ALL items (ignore expiration - CAUTION!)",
-            long_help = "Clean all items from the trash directory, regardless of their expiration status. This is irreversible for items that haven't expired yet - use extreme caution."
-        )]
+        #[arg(short = 'a', long, help = "Clean all items")]
         all: bool,
     },
-
-    #[command(
-        alias = "exp",
-        about = "Check expiration information for a trash item",
-        long_about = r#"Show detailed expiration information for a specific item in the trash.
-Displays:
-- Original path of the item
-- Time it was deleted
-- Exact expiration time
-- Remaining time until expiration (or time since expiration if expired)"#
-    )]
-    Expire {
-        #[arg(
-            required = true,
-            help = "Trash name to check expiration for",
-            long_help = "Trash name of the item to check (from `safe-rm list` output, e.g., 'file.txt_1735689000000000000')."
-        )]
-        name: String,
-    },
-
-    #[command(
-        alias = "empty",
-        about = "Permanently empty the entire trash directory",
-        long_about = r#"Permanently delete ALL items from the trash directory.
-This operation is irreversible - all files in trash will be permanently deleted.
-Requires confirmation by default - use --yes to skip confirmation."#
-    )]
+    #[command(alias = "empty", about = "Permanently empty trash")]
     Empty {
-        #[arg(
-            short = 'y',
-            long,
-            help = "Skip confirmation prompt - empty trash immediately",
-            long_help = "Bypass the confirmation prompt and immediately empty the entire trash directory. All items will be permanently deleted with no way to recover them."
-        )]
+        #[arg(short = 'y', long, help = "Skip confirmation")]
         yes: bool,
     },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct FileMeta {
-    original_path: PathBuf,
-    trash_path: PathBuf,
-    delete_time: String,
-    expire_days: i64,
-    file_type: FileType,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
-enum FileType {
-    File,
-    Dir,
-    Symlink,
-}
-
-// 递归复制：保留符号链接
-fn copy_path(src: &Path, dst: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(src)?;
-    if meta.file_type().is_dir() {
-        fs::create_dir_all(dst)?;
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let dst_entry = dst.join(entry.file_name());
-            copy_path(&entry.path(), &dst_entry)?;
-        }
-    } else if meta.file_type().is_symlink() {
-        let target = fs::read_link(src)?;
-        std::os::unix::fs::symlink(target, dst)?;
-    } else {
-        fs::copy(src, dst)?;
-    }
-    Ok(())
-}
-
-// 统一删除
-fn remove_path(path: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-
-// 加载元数据
-fn load_metadata(meta_file: &Path) -> HashMap<String, FileMeta> {
-    if !meta_file.exists() {
-        return HashMap::new();
-    }
-    match fs::read_to_string(meta_file) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(meta) => meta,
-            Err(e) => {
-                eprintln!("⚠️  Metadata corrupted: {}, resetting", e);
-                HashMap::new()
-            }
-        },
-        Err(e) => {
-            eprintln!("⚠️  Failed to read metadata: {}, resetting", e);
-            HashMap::new()
-        }
-    }
-}
-
-// 保存元数据（静默失败）
-fn save_metadata(metadata: &HashMap<String, FileMeta>, meta_file: &Path) {
-    if let Ok(content) = serde_json::to_string_pretty(metadata) {
-        let _ = fs::write(meta_file, content);
-    }
-}
-
-// 格式化剩余时间
-fn format_remaining(remaining: Duration) -> String {
-    if remaining.num_seconds() <= 0 {
-        return "Expired".to_string();
-    }
-    let days = remaining.num_days();
-    let hours = remaining.num_hours() % 24;
-    if days > 0 {
-        format!("{} days left", days)
-    } else {
-        format!("{} hours left", hours.max(1))
-    }
-}
-
-// 删除处理
-fn handle_delete(
-    path: &Path,
-    expire_days: i64,
-    force: bool,
-    trash_dir: &Path,
-    metadata: &mut HashMap<String, FileMeta>,
-) {
-    // 获取绝对路径（不解析符号链接！）
-    let path_abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match std::env::current_dir() {
-            Ok(cwd) => cwd.join(path),
-            Err(e) => {
-                eprintln!("⚠️  Skip '{}': Failed to get current dir: {}", path.display(), e);
-                return;
-            }
-        }
-    };
-
-    // 获取元数据（不解析符号链接）
-    let meta = match fs::symlink_metadata(&path_abs) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("⚠️  Skip '{}': {}", path.display(), e);
-            return;
-        }
-    };
-    let is_symlink = meta.file_type().is_symlink();
-    let file_type = if is_symlink {
-        FileType::Symlink
-    } else if meta.is_dir() {
-        FileType::Dir
-    } else {
-        FileType::File
-    };
-
-    // 系统目录保护（跳过符号链接）
-    if !force && !is_symlink {
-        let system_paths = ["/bin", "/sbin", "/etc", "/usr", "/lib", "/lib64", "/root", "/boot"];
-        let path_str = path_abs.to_str().unwrap_or("");
-        if system_paths.iter().any(|p| path_str.starts_with(p)) {
-            eprintln!("❌  Skip '{}': System directory protected (use -f to force)", path.display());
-            return;
-        }
-    }
-
-    let file_name = path_abs.file_name().unwrap().to_str().unwrap();
-    let timestamp = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let trash_name = format!("{}_{}", file_name, timestamp);
-    let trash_path = trash_dir.join(&trash_name);
-
-    println!("📤 Moving '{}' to trash (expire in {} days)...", path.display(), expire_days);
-    if copy_path(&path_abs, &trash_path).is_err() || remove_path(&path_abs).is_err() {
-        let _ = remove_path(&trash_path); // 回滚
-        eprintln!("❌  Failed to move '{}' to trash", path.display());
-        return;
-    }
-
-    metadata.insert(
-        trash_name,
-        FileMeta {
-            original_path: path_abs,
-            trash_path: trash_path.clone(),
-            delete_time: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            expire_days,
-            file_type,
-        },
-    );
-    println!("✅  Moved to trash: {}", trash_path.display());
-}
-
-// 恢复处理
-fn handle_restore(name: &str, force: bool, metadata: &mut HashMap<String, FileMeta>) {
-    let Some(meta) = metadata.remove(name) else {
-        eprintln!("❌  Restore '{}': Not found in trash", name);
-        return;
-    };
-
-    if !meta.trash_path.exists() {
-        eprintln!("❌  Restore '{}': Trash file not found", name);
-        metadata.insert(name.to_string(), meta);
-        return;
-    }
-
-    if meta.original_path.exists() && !force {
-        eprintln!(
-            "❌  Restore '{}': Target '{}' exists (use -f to force)",
-            name,
-            meta.original_path.display()
-        );
-        metadata.insert(name.to_string(), meta);
-        return;
-    }
-
-    if force && meta.original_path.exists() {
-        let _ = remove_path(&meta.original_path);
-    }
-
-    println!("🔄 Restoring '{}' to '{}'...", name, meta.original_path.display());
-    if copy_path(&meta.trash_path, &meta.original_path).is_err() || remove_path(&meta.trash_path).is_err() {
-        eprintln!("❌  Failed to restore '{}'", name);
-        metadata.insert(name.to_string(), meta);
-        return;
-    }
-    println!("✅  Restored: {}", meta.original_path.display());
-}
-
-// 列表展示
-fn handle_list(metadata: &HashMap<String, FileMeta>, expired: bool) {
-    if metadata.is_empty() {
-        println!("🗑️  Trash is empty");
-        return;
-    }
-
-    println!("=== Safe-RM Trash List (Total: {}) ===", metadata.len());
-    let now = Local::now();
-
-    for (name, meta) in metadata {
-        let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
-        let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-        let expire_time = delete_time + Duration::days(meta.expire_days);
-        let remaining_dur = expire_time.signed_duration_since(now);
-
-        if expired && remaining_dur.num_seconds() > 0 {
-            continue;
-        }
-
-        let remaining_str = format_remaining(remaining_dur);
-        println!("▶ Name: {}", name);
-        println!(
-            "  Type: {}",
-            match meta.file_type {
-                FileType::File => "File",
-                FileType::Dir => "Directory",
-                FileType::Symlink => "Symlink",
-            }
-        );
-        println!("  Original: {}", meta.original_path.display());
-        println!("  Delete Time: {}", meta.delete_time);
-        println!("  Expire: {} ({})", meta.expire_days, remaining_str);
-        println!("---------------------------");
-    }
-}
-
-// 清理回收站
-fn clean_trash(metadata: &mut HashMap<String, FileMeta>, clean_all: bool) {
-    let now = Local::now();
-    let to_remove: Vec<String> = metadata
-        .iter()
-        .filter(|(_, meta)| {
-            clean_all
-                || {
-                    let delete_time =
-                        NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
-                    let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-                    let expire_time = delete_time + Duration::days(meta.expire_days);
-                    now > expire_time
-                }
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    for name in to_remove {
-        if let Some(meta) = metadata.remove(&name) {
-            let _ = remove_path(&meta.trash_path);
-            println!("🗑️  Cleaned: {}", name);
-        }
-    }
-}
-
-// 检查过期时间
-fn handle_expire(name: &str, metadata: &HashMap<String, FileMeta>) {
-    let Some(meta) = metadata.get(name) else {
-        eprintln!("❌  '{}' not found in trash", name);
-        return;
-    };
-
-    let delete_time = NaiveDateTime::parse_from_str(&meta.delete_time, "%Y-%m-%d %H:%M:%S").unwrap();
-    let delete_time = Local.from_local_datetime(&delete_time).unwrap();
-    let expire_time = delete_time + Duration::days(meta.expire_days);
-    let remaining_dur = expire_time.signed_duration_since(Local::now());
-
-    println!("=== Expire Info for '{}' ===", name);
-    println!("Original Path: {}", meta.original_path.display());
-    println!("Delete Time: {}", meta.delete_time);
-    println!("Expire Time: {}", expire_time.format("%Y-%m-%d %H:%M:%S"));
-
-    if remaining_dur.num_seconds() > 0 {
-        println!(
-            "Remaining Time: {} days, {} hours",
-            remaining_dur.num_days(),
-            remaining_dur.num_hours() % 24
-        );
-    } else {
-        println!("Status: Expired ({} hours ago)", -remaining_dur.num_hours());
-    }
-}
-
-// 清空回收站
-fn handle_empty(yes: bool, metadata: &mut HashMap<String, FileMeta>) {
-    if !yes {
-        print!("⚠️  Are you sure to empty trash (permanent delete all)? [y/N]: ");
-        std::io::stdout().flush().unwrap();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if !input.trim().eq_ignore_ascii_case("y") {
-            println!("✅  Canceled");
-            return;
-        }
-    }
-
-    for (name, meta) in metadata.drain() {
-        let _ = remove_path(&meta.trash_path);
-        println!("🗑️  Deleted: {}", name);
-    }
-    println!("✅  Trash emptied completely!");
-}
-
 fn main() {
-    let home = home_dir().expect("Failed to get home directory");
-    let trash_dir = home.join(TRASH_DIR);
-    let meta_file = home.join(META_FILE);
-    fs::create_dir_all(&trash_dir).expect("Failed to create trash directory");
+    let base = get_srm_base();
+    let trash_dir = base.join("trash");
+    let meta_dir = base.join("meta");
+    fs::create_dir_all(&trash_dir).expect("Failed to create trash dir");
+    fs::create_dir_all(&meta_dir).expect("Failed to create meta dir");
+    rotate_logs(&base);
 
-    let mut metadata = load_metadata(&meta_file);
-    clean_trash(&mut metadata, false);
-    save_metadata(&metadata, &meta_file);
-
-    let cli = Cli::parse();
-    match cli.cmd {
+    match Cli::parse().cmd {
         Commands::Delete { paths, expire_days, force } => {
-            for path in paths {
-                handle_delete(&path, expire_days, force, &trash_dir, &mut metadata);
-            }
+            handle_delete_batch(paths, expire_days, force, &trash_dir, &meta_dir);
         }
-        Commands::Restore { names, force } => {
-            for name in names {
-                handle_restore(&name, force, &mut metadata);
-            }
+        Commands::Restore { names, force, target } => {
+            handle_restore(names, force, target, &meta_dir);
         }
-        Commands::List { expired } => {
-            handle_list(&metadata, expired);
-        }
+        Commands::List { expired } => handle_list(&meta_dir, expired),
         Commands::Clean { all } => {
-            clean_trash(&mut metadata, all);
-            println!("Clean completed!");
+            clean_trash(&meta_dir, all);
+            println!("✅ Clean completed!");
         }
-        Commands::Expire { name } => {
-            handle_expire(&name, &metadata);
-        }
-        Commands::Empty { yes } => {
-            handle_empty(yes, &mut metadata);
-        }
+        Commands::Empty { yes } => handle_empty(yes, &trash_dir, &meta_dir),
     }
 
-    save_metadata(&metadata, &meta_file);
+    log_event("INFO", "Command completed", None);
 }
