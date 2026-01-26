@@ -38,10 +38,9 @@ jobs:
       - name: Install System Dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y build-essential musl-tools upx  # 新增upx安装
-          # 验证依赖
+          sudo apt install -y build-essential musl-tools upx
           musl-gcc --version
-          upx --version  # 验证UPX安装成功
+          upx --version
 
       # 步骤4：静态编译二进制 + UPX压缩（核心整合）
       - name: Build Static Optimized Binary & UPX Compress
@@ -50,53 +49,50 @@ jobs:
           RUSTFLAGS="-C target-cpu=native -C link-arg=-static" \
           cargo build --release --target x86_64-unknown-linux-musl
 
-          # 强制验证二进制生成
+          # 强制验证二进制生成（✅ 修正为 srm）
           echo "=== 验证编译产物 ==="
           ls -lh target/x86_64-unknown-linux-musl/release/
-          if [ ! -f "target/x86_64-unknown-linux-musl/release/safe-rm" ]; then
+          if [ ! -f "target/x86_64-unknown-linux-musl/release/srm" ]; then
             echo "错误：二进制文件未生成！"
             exit 1
           fi
 
-          # 验证静态链接（关键：确保无系统依赖）
-          file target/x86_64-unknown-linux-musl/release/safe-rm
-          # 正常输出应包含：statically linked
+          # 验证静态链接
+          file target/x86_64-unknown-linux-musl/release/srm
 
-          # 新增：UPX压缩（--best --lzma 参数）
+          # UPX压缩（✅ 修正为 srm）
           echo "=== UPX压缩二进制 ==="
-          upx --best --lzma target/x86_64-unknown-linux-musl/release/safe-rm
-          # 验证压缩后文件仍可执行（非强制，避免压缩不兼容导致流程终止）
-          chmod +x target/x86_64-unknown-linux-musl/release/safe-rm
-          ./target/x86_64-unknown-linux-musl/release/safe-rm --help || echo "UPX压缩后功能验证（非强制）"
+          upx --best --lzma target/x86_64-unknown-linux-musl/release/srm
+          chmod +x target/x86_64-unknown-linux-musl/release/srm
+          ./target/x86_64-unknown-linux-musl/release/srm --help || echo "UPX压缩后功能验证（非强制）"
 
       # 步骤5：打包二进制+生成校验和
       - name: Package Binary & Generate Checksum
         run: |
           mkdir -p release
 
-          # 版本号处理（Tag推送用Tag名，非Tag用dev+提交哈希）
+          # 版本号处理
           VERSION="${{ github.ref_name }}"
           if [[ "${{ github.ref }}" != refs/tags/* ]]; then
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
 
-          # 复制并命名静态二进制（标注static，保留原有命名）
-          BIN_NAME="safe-rm-${VERSION}-linux-x86_64-static"
-          cp target/x86_64-unknown-linux-musl/release/safe-rm release/${BIN_NAME}
+          # 复制并命名静态二进制（✅ 修正为 srm）
+          BIN_NAME="srm-${VERSION}-linux-x86_64-static"
+          cp target/x86_64-unknown-linux-musl/release/srm release/${BIN_NAME}
 
           # 生成SHA256校验和
           sha256sum release/${BIN_NAME} > release/${BIN_NAME}.sha256
 
-          # 输出打包结果
           echo "=== 最终打包文件 ==="
           ls -lh release/
           cat release/${BIN_NAME}.sha256
 
-      # 步骤6：上传Artifact（便于手动下载）
+      # 步骤6：上传Artifact
       - name: Upload Binary to Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: safe-rm-linux-x86_64-static-${{ github.ref_name }}
+          name: srm-linux-x86_64-static-${{ github.ref_name }}
           path: release/
           retention-days: 30
 
@@ -106,45 +102,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static
-            release/safe-rm-${{ github.ref_name }}-linux-x86_64-static.sha256
+            release/srm-${{ github.ref_name }}-linux-x86_64-static
+            release/srm-${{ github.ref_name }}-linux-x86_64-static.sha256
           generate_release_notes: true
           prerelease: false
           name: "Release ${{ github.ref_name }} (Static Binary)"
           tag_name: ${{ github.ref_name }}
-
-  # 可选：Windows x86_64 构建（如需可取消注释）
-  # build-windows-x86_64:
-  #   name: Build Windows x86_64 Binary
-  #   runs-on: windows-2022
-  #   steps:
-  #     - name: Checkout Source Code
-  #       uses: actions/checkout@v4
-  #     - name: Install Rust Toolchain
-  #       uses: dtolnay/rust-toolchain@v1
-  #       with:
-  #         toolchain: stable
-  #         target: x86_64-pc-windows-msvc
-  #     - name: Build Binary
-  #       run: cargo build --release --target x86_64-pc-windows-msvc
-  #     - name: Package Binary
-  #       run: |
-  #         mkdir -p release
-  #         $VERSION="${{ github.ref_name }}"
-  #         if (-not $env:GITHUB_REF.StartsWith('refs/tags/')) {
-  #           $VERSION="dev-$(git rev-parse --short HEAD)"
-  #         }
-  #         Copy-Item target/x86_64-pc-windows-msvc/release/safe-rm.exe release/safe-rm-${VERSION}-windows-x86_64.exe
-  #         Get-FileHash -Algorithm SHA256 release/safe-rm-${VERSION}-windows-x86_64.exe | Format-List | Out-File release/safe-rm-${VERSION}-windows-x86_64.sha256
-  #     - name: Upload Artifact
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: safe-rm-windows-x86_64-${{ github.ref_name }}
-  #         path: release/
-  #     - name: Publish to GitHub Releases
-  #       if: startsWith(github.ref, 'refs/tags/')
-  #       uses: softprops/action-gh-release@v2
-  #       with:
-  #         files: |
-  #           release/safe-rm-${{ github.ref_name }}-windows-x86_64.exe
-  #           release/safe-rm-${{ github.ref_name }}-windows-x86_64.sha256
