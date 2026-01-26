@@ -154,3 +154,5 @@ jobs:
           # 验证发布
           echo "✅ Release published successfully (no UPX compression)!"
           gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
+
+          
