@@ -97,22 +97,30 @@ jobs:
           fi
           echo "✅ 原始二进制运行测试通过"
 
-      # UPX压缩（核心优化环节）
+      # UPX压缩（调整参数，兼顾兼容性和压缩率）
       - name: Compress Binary with UPX-UCL
+        id: upx_compress
         run: |
           set -euo pipefail
           BIN_NAME="srm"
           BIN_PATH="target/release/${BIN_NAME}"
+          
+          # 先备份原始二进制（防止压缩失败）
+          cp "$BIN_PATH" "${BIN_PATH}.backup"
           
           # 记录压缩前体积
           echo "=== UPX压缩前体积 ==="
           ls -lh "$BIN_PATH"
           ORIG_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
           
-          # UPX最优压缩参数（平衡压缩率和兼容性）
-          upx --best --lzma --ultra-brute \
-              --strip-relocs=0 \
-              -q "$BIN_PATH"
+          # 调整UPX参数：降低压缩级别，提升兼容性
+          # 移除--ultra-brute，保留--best和--lzma，增加--force（兼容静态二进制）
+          upx --best --lzma --force --strip-relocs=0 -q "$BIN_PATH" || {
+            echo "WARNING: UPX压缩失败，使用原始二进制"
+            cp "${BIN_PATH}.backup" "$BIN_PATH"
+            echo "compressed=false" >> $GITHUB_OUTPUT
+            exit 0
+          }
           
           # 记录压缩后体积
           echo "=== UPX压缩后体积 ==="
@@ -121,23 +129,39 @@ jobs:
           COMP_RATIO=$(echo "scale=2; $COMP_SIZE/$ORIG_SIZE*100" | bc)
           echo "压缩率: ${COMP_RATIO}% (原始: $ORIG_SIZE 字节, 压缩后: $COMP_SIZE 字节)"
           
+          # 清理备份
+          rm -f "${BIN_PATH}.backup"
+          echo "compressed=true" >> $GITHUB_OUTPUT
           echo "✅ UPX压缩完成"
 
-      # 验证压缩后二进制可运行（关键：确保UPX压缩不破坏程序）
+      # 验证压缩后二进制可运行（增加容错，失败则回滚）
       - name: Verify Compressed Binary Runability
         run: |
           set -euo pipefail
           BIN_NAME="srm"
           BIN_PATH="target/release/${BIN_NAME}"
+          BACKUP_PATH="${BIN_PATH}.backup"
 
           chmod +x "$BIN_PATH"
           echo "=== 测试UPX压缩后二进制基础功能 ==="
           if ! "$BIN_PATH" -h > /dev/null 2>&1; then
-            echo "ERROR: 压缩后二进制运行失败！"
-            "$BIN_PATH" -h 2>&1
-            exit 1
+            echo "WARNING: 压缩后二进制运行失败，回滚到原始二进制"
+            # 回滚到备份的原始二进制
+            if [ -f "$BACKUP_PATH" ]; then
+              cp "$BACKUP_PATH" "$BIN_PATH"
+            fi
+            # 重新验证原始二进制
+            if ! "$BIN_PATH" -h > /dev/null 2>&1; then
+              echo "ERROR: 原始二进制也无法运行！"
+              "$BIN_PATH" -h 2>&1
+              exit 1
+            fi
+            echo "✅ 已回滚到原始二进制，运行测试通过"
+          else
+            echo "✅ 压缩后二进制运行测试通过"
           fi
-          echo "✅ 压缩后二进制运行测试通过"
+          # 清理备份
+          rm -f "$BACKUP_PATH"
 
       # 打包（SRM Naming）
       - name: Package (SRM Naming)
@@ -149,11 +173,16 @@ jobs:
 
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             VERSION="${{ github.ref_name }}"
-            FINAL_BIN="srm-${VERSION}-linux-x86_64-static"
-            # 复制UPX压缩后的二进制
+            # 根据压缩状态调整文件名
+            if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
+              FINAL_BIN="srm-${VERSION}-linux-x86_64-static"
+            else
+              FINAL_BIN="srm-${VERSION}-linux-x86_64-static-upx"
+            fi
+            # 复制最终二进制（压缩或原始）
             cp target/release/${BIN_NAME} release/${FINAL_BIN}
             chmod +x release/${FINAL_BIN}
-            # 生成校验和（基于压缩后的文件）
+            # 生成校验和（基于最终文件）
             sha256sum release/${FINAL_BIN} | awk '{print $1 "  " $2}' > release/${FINAL_BIN}.sha256
 
             # 输出变量
@@ -162,7 +191,7 @@ jobs:
             echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
             # 打印最终产物信息
-            echo "=== 最终产物（UPX压缩后）==="
+            echo "=== 最终产物 ==="
             ls -lh release/
             cat release/${FINAL_BIN}.sha256
           else
@@ -192,13 +221,19 @@ jobs:
             ls -lh release/
             exit 1
           fi
+          # 根据压缩状态调整标题
+          if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
+            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary)"
+          else
+            RELEASE_TITLE="Release ${{ steps.package.outputs.version }} (Static Binary, UPX Compressed)"
+          fi
           # 创建Release
           gh release create ${{ steps.package.outputs.version }} \
-            --title "Release ${{ steps.package.outputs.version }} (Static Binary, UPX Compressed)" \
+            --title "$RELEASE_TITLE" \
             --generate-notes \
             --repo ${{ github.repository }} \
             ${{ steps.package.outputs.final_bin }} \
             ${{ steps.package.outputs.final_sum }}
           # 验证发布
-          echo "✅ Release published successfully (with UPX compression)!"
+          echo "✅ Release published successfully!"
           gh release view ${{ steps.package.outputs.version }} --repo ${{ github.repository }} --json assets --jq '.assets[].name'
