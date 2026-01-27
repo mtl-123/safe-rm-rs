@@ -29,7 +29,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      # 安装系统依赖（恢复upx-ucl）
+      # 安装系统依赖（upx-ucl）
       - name: Install System Dependencies
         run: |
           set -euo pipefail
@@ -45,7 +45,7 @@ jobs:
           upx --version || echo "UPX版本检查完成"
           echo "✅ 系统依赖安装成功（包含UPX）"
 
-      # 静态编译（修复Shell语法错误，增强体积优化）
+      # 静态编译（增强体积优化）
       - name: Build Static Binary
         run: |
           set -euo pipefail
@@ -104,15 +104,15 @@ jobs:
           set -euo pipefail
           BIN_NAME="srm"
           BIN_PATH="target/release/${BIN_NAME}"
-          
+
           # 先备份原始二进制（防止压缩失败）
           cp "$BIN_PATH" "${BIN_PATH}.backup"
-          
+
           # 记录压缩前体积
           echo "=== UPX压缩前体积 ==="
           ls -lh "$BIN_PATH"
           ORIG_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
-          
+
           # 调整UPX参数：降低压缩级别，提升兼容性
           # 移除--ultra-brute，保留--best和--lzma，增加--force（兼容静态二进制）
           upx --best --lzma --force --strip-relocs=0 -q "$BIN_PATH" || {
@@ -121,14 +121,14 @@ jobs:
             echo "compressed=false" >> $GITHUB_OUTPUT
             exit 0
           }
-          
+
           # 记录压缩后体积
           echo "=== UPX压缩后体积 ==="
           ls -lh "$BIN_PATH"
           COMP_SIZE=$(du -b "$BIN_PATH" | awk '{print $1}')
           COMP_RATIO=$(echo "scale=2; $COMP_SIZE/$ORIG_SIZE*100" | bc)
           echo "压缩率: ${COMP_RATIO}% (原始: $ORIG_SIZE 字节, 压缩后: $COMP_SIZE 字节)"
-          
+
           # 清理备份
           rm -f "${BIN_PATH}.backup"
           echo "compressed=true" >> $GITHUB_OUTPUT
@@ -171,7 +171,7 @@ jobs:
           # 确保release目录始终存在
           mkdir -p release
           BIN_NAME="srm"
-          
+
           # 区分tag和非tag场景的命名规则
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
             # Tag推送（正式版本）
@@ -193,7 +193,7 @@ jobs:
             fi
             VERSION="dev-${SHORT_SHA}"
           fi
-          
+
           # 复制二进制文件（无论是否tag都执行）
           cp target/release/${BIN_NAME} release/${FINAL_BIN}
           chmod +x release/${FINAL_BIN}
@@ -217,7 +217,7 @@ jobs:
           name: srm-linux-x86_64-static-${{ steps.package.outputs.version }}
           path: release/
           retention-days: 30
-          if-no-files-found: error  # 改为error，确保有文件才继续
+          if-no-files-found: error # 改为error，确保有文件才继续
 
       # 发布到GitHub Releases（仅Tag推送时执行）
       - name: Publish to GitHub Releases
