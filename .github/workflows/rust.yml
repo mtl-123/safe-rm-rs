@@ -163,15 +163,18 @@ jobs:
           # 清理备份
           rm -f "$BACKUP_PATH"
 
-      # 打包（SRM Naming）
+      # 打包（优化：所有场景都生成release文件，区分tag/非tag）
       - name: Package (SRM Naming)
         id: package
         run: |
           set -euo pipefail
+          # 确保release目录始终存在
           mkdir -p release
           BIN_NAME="srm"
-
+          
+          # 区分tag和非tag场景的命名规则
           if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            # Tag推送（正式版本）
             VERSION="${{ github.ref_name }}"
             # 根据压缩状态调整文件名
             if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
@@ -179,34 +182,44 @@ jobs:
             else
               FINAL_BIN="srm-${VERSION}-linux-x86_64-static-upx"
             fi
-            # 复制最终二进制（压缩或原始）
-            cp target/release/${BIN_NAME} release/${FINAL_BIN}
-            chmod +x release/${FINAL_BIN}
-            # 生成校验和（基于最终文件）
-            sha256sum release/${FINAL_BIN} | awk '{print $1 "  " $2}' > release/${FINAL_BIN}.sha256
-
-            # 输出变量
-            echo "final_bin=release/${FINAL_BIN}" >> $GITHUB_OUTPUT
-            echo "final_sum=release/${FINAL_BIN}.sha256" >> $GITHUB_OUTPUT
-            echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-            # 打印最终产物信息
-            echo "=== 最终产物 ==="
-            ls -lh release/
-            cat release/${FINAL_BIN}.sha256
           else
-            echo "Not a tag push, skip packaging"
+            # 非Tag推送（开发版本）
+            COMMIT_SHA="${{ github.sha }}"
+            SHORT_SHA="${COMMIT_SHA:0:8}"  # 取前8位短SHA
+            if [ "${{ steps.upx_compress.outputs.compressed }}" == "false" ]; then
+              FINAL_BIN="srm-dev-${SHORT_SHA}-linux-x86_64-static"
+            else
+              FINAL_BIN="srm-dev-${SHORT_SHA}-linux-x86_64-static-upx"
+            fi
+            VERSION="dev-${SHORT_SHA}"
           fi
+          
+          # 复制二进制文件（无论是否tag都执行）
+          cp target/release/${BIN_NAME} release/${FINAL_BIN}
+          chmod +x release/${FINAL_BIN}
+          # 生成校验和（无论是否tag都执行）
+          sha256sum release/${FINAL_BIN} | awk '{print $1 "  " $2}' > release/${FINAL_BIN}.sha256
 
-      # 上传Artifact
+          # 输出变量（统一格式）
+          echo "final_bin=release/${FINAL_BIN}" >> $GITHUB_OUTPUT
+          echo "final_sum=release/${FINAL_BIN}.sha256" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          # 打印最终产物信息
+          echo "=== 最终产物 ==="
+          ls -lh release/
+          cat release/${FINAL_BIN}.sha256
+
+      # 上传Artifact（所有场景都上传，名称统一）
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ startsWith(github.ref, 'refs/tags/') && format('srm-linux-x86_64-static-{0}', github.ref_name) || format('srm-linux-x86_64-static-dev-{0}', github.sha) }}
+          name: srm-linux-x86_64-static-${{ steps.package.outputs.version }}
           path: release/
           retention-days: 30
+          if-no-files-found: error  # 改为error，确保有文件才继续
 
-      # 发布到GitHub Releases
+      # 发布到GitHub Releases（仅Tag推送时执行）
       - name: Publish to GitHub Releases
         if: startsWith(github.ref, 'refs/tags/')
         env:
