@@ -45,7 +45,7 @@ jobs:
           upx --version || echo "UPX版本检查完成"
           echo "✅ 系统依赖安装成功（包含UPX）"
 
-      # 静态编译（移除Glibc标注，增强体积优化）
+      # 静态编译（修复Shell语法错误，增强体积优化）
       - name: Build Static Binary
         run: |
           set -euo pipefail
@@ -53,16 +53,17 @@ jobs:
           BIN_PATH="target/release/${BIN_NAME}"
 
           # 优化的RUSTFLAGS（增强体积优化）
-          RUSTFLAGS="\
-            -C target-cpu=native \
+          # -C debuginfo=0: 彻底关闭调试信息
+          # -C codegen-units=1: 单代码生成单元，优化编译体积
+          RUSTFLAGS="-C target-cpu=native \
             -C link-arg=-static \
             -C link-arg=-static-libgcc \
             -C link-arg=-static-libstdc++ \
             -C opt-level=3 \
             -C panic=abort \
             -C strip=symbols \
-            -C debuginfo=0 \          # 彻底关闭调试信息
-            -C codegen-units=1" \     # 单代码生成单元，优化编译体积
+            -C debuginfo=0 \
+            -C codegen-units=1"
           cargo build --release -v
 
           # 验证产物
@@ -138,7 +139,7 @@ jobs:
           fi
           echo "✅ 压缩后二进制运行测试通过"
 
-      # 打包（SRM命名）
+      # 打包（SRM Naming）
       - name: Package (SRM Naming)
         id: package
         run: |
