@@ -232,6 +232,9 @@ git tag
 git tag -d v1.0.1
 git tag -d v1.0.2  # 如有其他旧Tag，依次删除
 
+# 查询远程仓库版本号
+git ls-remote --tags origin
+
 # 3. 单个删除远程Tag（同步清理GitHub Releases页面的旧版本）
 git push origin --delete v1.0.1
 git push origin --delete v1.0.2  # 对应删除远程Tag
