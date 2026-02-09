@@ -1,9 +1,3 @@
-经过仔细比对，**您提供的文档与代码功能基本一致，但存在一个关键缺失**：
-
-### ❌ 文档中提到了 `srm exp`（检查过期时间）命令，但代码中**没有实现该功能**
-
-在您的 Markdown 文档中：
-```markdown
 ### 5. 检查过期时间（expire/exp）
 ...
 safe-rm exp test.txt_1735689000000000000  # 检查文件过期信息
@@ -364,17 +358,3 @@ command rm temp_file.txt    # 真正删除（绕过 srm）
 ```
 
 > ✅ **优势**：系统脚本仍使用原生 `rm`，不影响系统稳定性。
-
----
-
-## 许可证
-
-MIT License
-
-Copyright (c) 2026 Your Name
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
